@@ -15,7 +15,7 @@
 import os, time, re, asyncio, html, random
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, BotCommand, WebAppInfo, MenuButtonWebApp
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -27,6 +27,16 @@ BASE = os.environ.get("DATA_BASE", "https://dikey123.github.io/football-prognozy
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задан BOT_TOKEN (переменная окружения).")
+
+# Обязательная подписка: @username или -100id канала/группы. Пусто = проверка выключена.
+REQUIRED_CHAT = os.environ.get("REQUIRED_CHAT", "").strip()
+CHANNEL_URL = os.environ.get("CHANNEL_URL", "").strip()
+def channel_link():
+    if CHANNEL_URL:
+        return CHANNEL_URL
+    if REQUIRED_CHAT.startswith("@"):
+        return "https://t.me/" + REQUIRED_CHAT[1:]
+    return ""
 
 _cache = {"t": 0, "data": None, "res": None}
 
@@ -319,8 +329,58 @@ def screen_express(data):
     out.append("<i>Должны сыграть все события. Аналитика, не гарантия. 18+</i>")
     return "\n".join(out)
 
+# ---------- обязательная подписка на канал/группу ----------
+async def is_subscribed(bot, uid):
+    if not REQUIRED_CHAT:
+        return True
+    try:
+        m = await bot.get_chat_member(REQUIRED_CHAT, uid)
+        return m.status in ("member", "administrator", "creator")
+    except Exception as ex:
+        print("Проверка подписки не удалась (бот — админ канала?):", ex)
+        return True  # при неверной настройке не ломаем бота
+
+def gate_kb():
+    kb = InlineKeyboardBuilder()
+    link = channel_link()
+    if link:
+        kb.button(text="📢 Подписаться", url=link)
+    kb.button(text="✅ Я подписался", callback_data="check_sub")
+    kb.adjust(1)
+    return kb.as_markup()
+
+GATE_TEXT = ("🔒 Доступ к боту «Капер ИИ» — только для подписчиков нашего канала (бесплатно).\n\n"
+             "Подпишитесь по кнопке ниже и нажмите «✅ Я подписался».")
+
+class SubGate(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        bot = data.get("bot")
+        user = data.get("event_from_user")
+        if isinstance(event, CallbackQuery) and event.data == "check_sub":
+            if await is_subscribed(bot, user.id):
+                await event.answer("Готово! Доступ открыт ✅")
+                try:
+                    await event.message.edit_text(
+                        "👋 Доступ открыт. Это <b>Капер ИИ</b> — выберите раздел:",
+                        reply_markup=main_kb())
+                except Exception:
+                    await event.message.answer("Доступ открыт.", reply_markup=main_kb())
+            else:
+                await event.answer("Пока не вижу подписку. Подпишитесь и нажмите ещё раз.", show_alert=True)
+            return
+        if user and not await is_subscribed(bot, user.id):
+            if isinstance(event, CallbackQuery):
+                await event.answer()
+                await event.message.answer(GATE_TEXT, reply_markup=gate_kb())
+            else:
+                await event.answer(GATE_TEXT, reply_markup=gate_kb())
+            return
+        return await handler(event, data)
+
 # ---------- хэндлеры ----------
 dp = Dispatcher()
+dp.message.outer_middleware(SubGate())
+dp.callback_query.outer_middleware(SubGate())
 
 @dp.message(CommandStart())
 async def start(msg: Message):
