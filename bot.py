@@ -17,7 +17,7 @@ import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, BotCommand
+from aiogram.types import Message, CallbackQuery, BotCommand, WebAppInfo, MenuButtonWebApp
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -80,10 +80,11 @@ def find_match(data, tid, idx):
 # ---------- экранчики ----------
 def main_kb():
     kb = InlineKeyboardBuilder()
+    kb.button(text="📱 Открыть приложение", web_app=WebAppInfo(url=BASE))
     kb.button(text="⚽ Матчи сегодня", callback_data="today")
     kb.button(text="🏆 Рейтинг", callback_data="rating")
     kb.button(text="⚡ Экспресс дня", callback_data="express")
-    kb.adjust(1, 2)
+    kb.adjust(1, 1, 2)
     return kb.as_markup()
 
 async def screen_today(data):
@@ -294,6 +295,12 @@ async def start(msg: Message):
         "<i>18+. Это аналитика, а не гарантия результата.</i>",
         reply_markup=main_kb())
 
+@dp.message(Command("app"))
+async def cmd_app(msg: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📱 Открыть приложение", web_app=WebAppInfo(url=BASE))
+    await msg.answer("Открыть «Капер ИИ» как приложение — на весь экран:", reply_markup=kb.as_markup())
+
 @dp.message(Command("today"))
 async def cmd_today(msg: Message):
     data, _ = await get_data()
@@ -380,10 +387,16 @@ async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands([
         BotCommand(command="start", description="Меню"),
+        BotCommand(command="app", description="Открыть приложение"),
         BotCommand(command="today", description="Матчи сегодня"),
         BotCommand(command="rating", description="Рейтинг прогнозистов"),
         BotCommand(command="express", description="Экспресс дня"),
     ])
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE)))
+    except Exception as ex:
+        print("Не удалось задать кнопку-меню:", ex)
     await start_web()
     print("Бот запущен (polling)…")
     await dp.start_polling(bot)
