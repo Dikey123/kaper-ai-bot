@@ -109,6 +109,20 @@ def bar(cnt):
     def blk(n): return "█" * round(n / tot * 10)
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
+def opinion_block(src, emoji, name):
+    """Единый блок мнения одного ИИ. src = {score, text, conf(0-5), bet}. Пусто → "" ."""
+    if not src:
+        return ""
+    try:
+        conf = max(0, min(5, int(src.get("conf", 0) or 0)))
+    except (TypeError, ValueError):
+        conf = 0
+    dots = "●" * conf + "○" * (5 - conf)
+    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
+    if src.get("bet"):
+        out += f"\nВыбор {name}: <b>{e(src['bet'])}</b>  (уверенность {dots})"
+    return out
+
 def screen_match(t, m):
     lines = [f"<b>{e(m['home'])} — {e(m['away'])}</b>",
              f"{e(t.get('name',''))} · {e(t.get('round',''))}",
@@ -127,13 +141,11 @@ def screen_match(t, m):
             cnt[tp["lean"]] += 1
     if sum(cnt.values()):
         lines.append(f"\n<b>Куда склоняются эксперты</b> ({sum(cnt.values())} прогнозов): " + bar(cnt))
-    # ИИ
-    ai = m.get("ai")
-    if ai:
-        conf = "●" * int(ai.get("conf", 0)) + "○" * (5 - int(ai.get("conf", 0)))
-        lines.append(f"\n🤖 <b>Мнение ИИ</b>: счёт <b>{e(ai.get('score',''))}</b>\n{e(ai.get('text',''))}")
-        if ai.get("bet"):
-            lines.append(f"Выбор ИИ: <b>{e(ai['bet'])}</b>  (уверенность {conf})")
+    # Мнения ИИ — два источника (Claude в поле "ai", ChatGPT в поле "gpt")
+    for blk in (opinion_block(m.get("ai"), "🤖", "ИИ"),
+                opinion_block(m.get("gpt"), "🧠", "ChatGPT")):
+        if blk:
+            lines.append(blk)
     return "\n".join(lines)
 
 def match_kb(t, idx, m):
@@ -200,6 +212,11 @@ def screen_rating(res):
     an = ai["win"] + ai["lose"]
     rows.append({"src": "🤖 Мнение ИИ", "reg": "ai", "win": ai["win"], "lose": ai["lose"],
                  "pct": round(ai["win"]/an*100) if an else 0, "w": wilson(ai["win"], an), "n": an, "ai": True})
+    gpt = res.get("gpt")
+    if gpt:
+        gn = gpt["win"] + gpt["lose"]
+        rows.append({"src": "🧠 ChatGPT", "reg": "ai", "win": gpt["win"], "lose": gpt["lose"],
+                     "pct": round(gpt["win"]/gn*100) if gn else 0, "w": wilson(gpt["win"], gn), "n": gn, "ai": True})
     rows.sort(key=lambda r: (-r["w"], -r["n"], -r["pct"]))
     out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% проходимости по {res.get('matches',0)} сыгранным матчам</i>\n"]
     for i, r in enumerate(rows[:25], 1):
