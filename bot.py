@@ -51,6 +51,25 @@ async def fetch_json(session, url):
     except Exception:
         return None
 
+def gpt_key(date, home, away):
+    return f"{date}|{home}|{away}"
+
+def merge_gpt(data, gpt):
+    """Вливает мнения ChatGPT из отдельного gpt.json в матчи data.json.
+    Ключ матча: 'дата|хозяева|гости'. Если в data.json мнение уже есть — не трогаем."""
+    if not data or not gpt:
+        return
+    gm = gpt.get("matches") if isinstance(gpt, dict) else None
+    if not isinstance(gm, dict):
+        return
+    for t in data.get("tournaments", []):
+        for m in t.get("matches", []):
+            if m.get("gpt"):
+                continue
+            op = gm.get(gpt_key(m.get("date",""), m.get("home",""), m.get("away","")))
+            if isinstance(op, dict):
+                m["gpt"] = op
+
 async def get_data(force=False):
     now = time.time()
     if not force and _cache["data"] and now - _cache["t"] < 300:
@@ -58,7 +77,9 @@ async def get_data(force=False):
     async with aiohttp.ClientSession() as s:
         data = await fetch_json(s, BASE + "data.json")
         res  = await fetch_json(s, BASE + "results.json")
+        gpt  = await fetch_json(s, BASE + "gpt.json")
     if data:
+        merge_gpt(data, gpt)
         _cache.update(t=now, data=data, res=res)
     return _cache["data"], _cache["res"]
 
