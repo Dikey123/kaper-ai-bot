@@ -12,7 +12,7 @@
 Токен НЕ хранится в коде. Передаётся через переменную окружения BOT_TOKEN.
 Запуск локально:   BOT_TOKEN=xxxx python bot.py
 """
-import os, time, re, asyncio, html, random, json, hmac, hashlib
+import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime
 import aiohttp
 from aiohttp import web
 from urllib.parse import parse_qsl
@@ -548,6 +548,87 @@ async def start_web(bot):
     await site.start()
     print(f"Веб-сервер слушает порт {port} (health + /api/data)")
 
+# ---------- авто-постинг в канал ----------
+BOT_USERNAME = ""
+def bot_link():
+    return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else (channel_link() or "https://t.me/")
+
+def _leader_and_ai(res):
+    if not res or not res.get("sources"):
+        return None, None
+    rr = []
+    for src, v in res["sources"].items():
+        n = v["win"] + v["lose"]
+        rr.append((wilson(v["win"], n), src, round(v["win"]/n*100) if n else 0))
+    rr.sort(reverse=True)
+    leader = rr[0] if rr else None
+    ai = res.get("ai", {"win": 0, "lose": 0})
+    an = ai["win"] + ai["lose"]
+    aistat = (round(ai["win"]/an*100), ai["win"], ai["lose"]) if an else None
+    return leader, aistat
+
+async def post_daily(bot):
+    if not REQUIRED_CHAT:
+        return False
+    data, res = await get_data()
+    if not data:
+        return False
+    today = data.get("today")
+    rows = [m for (t, i, m) in all_matches(data) if m.get("date") == today]
+    if not rows:
+        return False  # нет матчей — не постим
+    parts = ["🔥 <b>Капер ИИ</b> — прогнозы на сегодня",
+             f"⚽ Матчей сегодня: <b>{len(rows)}</b> · {e(dlabel(today))}", ""]
+    parts.append(screen_express(data))
+    leader, aistat = _leader_and_ai(res)
+    tail = []
+    if leader:
+        tail.append(f"🏆 Лидер прогнозистов: <b>{e(leader[1])}</b> — {leader[2]}%")
+    if aistat:
+        tail.append(f"🤖 ИИ: <b>{aistat[0]}%</b> проходимости ({aistat[1]}–{aistat[2]})")
+    if tail:
+        parts.append("\n" + "\n".join(tail))
+    parts.append("\nВсе прогнозы, составы и свой экспресс — в приложении 👇\n<i>18+. Аналитика, не гарантия.</i>")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚽ Открыть в боте", url=bot_link())
+    await bot.send_message(REQUIRED_CHAT, "\n".join(parts),
+                           reply_markup=kb.as_markup(), disable_web_page_preview=True)
+    print("Пост в канал отправлен.")
+    return True
+
+POST_TIMES = [(10, 15)]  # часы:минуты МСК для авто-постов в канал
+async def channel_poster(bot):
+    if not REQUIRED_CHAT:
+        return
+    MSK = datetime.timezone(datetime.timedelta(hours=3))
+    while True:
+        now = datetime.datetime.now(MSK)
+        cands = []
+        for h, m in POST_TIMES:
+            t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if t <= now:
+                t += datetime.timedelta(days=1)
+            cands.append(t)
+        await asyncio.sleep(max(30, (min(cands) - now).total_seconds()))
+        try:
+            await post_daily(bot)
+        except Exception as ex:
+            print("channel_poster:", ex)
+        await asyncio.sleep(70)
+
+@dp.message(Command("post"))
+async def cmd_post(msg: Message):
+    if not REQUIRED_CHAT:
+        return await msg.answer("Канал не настроен (REQUIRED_CHAT пуст).")
+    try:
+        m = await msg.bot.get_chat_member(REQUIRED_CHAT, msg.from_user.id)
+        if m.status not in ("administrator", "creator"):
+            return await msg.answer("Команда доступна только администраторам канала.")
+    except Exception:
+        return await msg.answer("Не удалось проверить права (бот — админ канала?).")
+    ok = await post_daily(msg.bot)
+    await msg.answer("Пост отправлен в канал ✅" if ok else "Сегодня нет матчей — пост не отправлен.")
+
 async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands([
@@ -566,7 +647,14 @@ async def main():
                 menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE)))
     except Exception as ex:
         print("Не удалось задать кнопку-меню:", ex)
+    global BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
+    except Exception as ex:
+        print("get_me:", ex)
     await start_web(bot)
+    asyncio.create_task(channel_poster(bot))
     print("Бот запущен (polling)…")
     await dp.start_polling(bot)
 
