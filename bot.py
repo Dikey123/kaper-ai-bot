@@ -12,9 +12,10 @@
 Токен НЕ хранится в коде. Передаётся через переменную окружения BOT_TOKEN.
 Запуск локально:   BOT_TOKEN=xxxx python bot.py
 """
-import os, time, re, asyncio, html, random
+import os, time, re, asyncio, html, random, json, hmac, hashlib
 import aiohttp
 from aiohttp import web
+from urllib.parse import parse_qsl
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, BotCommand, WebAppInfo, MenuButtonWebApp, MenuButtonDefault
@@ -487,19 +488,65 @@ async def cb_sub(c: CallbackQuery):
     await c.answer()
 
 # ---------- мини веб-сервер (для хостингов типа Render, чтобы сервис считался живым) ----------
+# ---------- защищённая выдача данных для Mini App ----------
+def check_init_data(init_data, token, max_age=86400):
+    """Проверка подписи Telegram WebApp initData. Возвращает user_id или None."""
+    try:
+        pairs = dict(parse_qsl(init_data, strict_parsing=True))
+    except Exception:
+        return None
+    h = pairs.pop("hash", None)
+    if not h:
+        return None
+    dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, h):
+        return None
+    try:
+        if max_age and time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+    except Exception:
+        pass
+    try:
+        return json.loads(pairs.get("user", "{}")).get("id")
+    except Exception:
+        return None
+
+CORS = {"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"}
+
 async def _health(request):
     return web.Response(text="Капер ИИ — бот работает. 18+")
 
-async def start_web():
+async def api_data(request):
+    uid = check_init_data(request.query.get("initData", ""), TOKEN)
+    if not uid:
+        return web.json_response({"error": "no_tg"}, status=403, headers=CORS)
+    if not await is_subscribed(request.app["bot"], uid):
+        return web.json_response({"error": "not_subscribed"}, status=403, headers=CORS)
+    data, res = await get_data()
+    if not data:
+        return web.json_response({"error": "nodata"}, status=503, headers=CORS)
+    return web.json_response({"data": data, "res": res}, headers=CORS)
+
+async def api_options(request):
+    return web.Response(status=204, headers={**CORS,
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*"})
+
+async def start_web(bot):
     port = int(os.environ.get("PORT", "10000"))
     app = web.Application()
+    app["bot"] = bot
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
+    app.router.add_get("/api/data", api_data)
+    app.router.add_options("/api/data", api_options)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Веб-сервер слушает порт {port} (health-check)")
+    print(f"Веб-сервер слушает порт {port} (health + /api/data)")
 
 async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -519,7 +566,7 @@ async def main():
                 menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE)))
     except Exception as ex:
         print("Не удалось задать кнопку-меню:", ex)
-    await start_web()
+    await start_web(bot)
     print("Бот запущен (polling)…")
     await dp.start_polling(bot)
 
