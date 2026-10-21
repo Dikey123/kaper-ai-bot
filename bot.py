@@ -17,7 +17,7 @@ import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, BotCommand, WebAppInfo, MenuButtonWebApp
+from aiogram.types import Message, CallbackQuery, BotCommand, WebAppInfo, MenuButtonWebApp, MenuButtonDefault
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -352,12 +352,29 @@ def gate_kb():
 GATE_TEXT = ("🔒 Доступ к боту «Капер ИИ» — только для подписчиков нашего канала (бесплатно).\n\n"
              "Подпишитесь по кнопке ниже и нажмите «✅ Я подписался».")
 
+# Персональная кнопка-меню: подписчику — «Приложение», остальным — обычная (без приложения).
+_menu_state = {}  # uid -> bool (True = кнопка приложения стоит)
+async def set_user_menu(bot, uid, allow):
+    if not REQUIRED_CHAT:
+        return  # гейт выключен — приложением управляет глобальная кнопка
+    if _menu_state.get(uid) == allow:
+        return
+    try:
+        btn = (MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE))
+               if allow else MenuButtonDefault())
+        await bot.set_chat_menu_button(chat_id=uid, menu_button=btn)
+        _menu_state[uid] = allow
+    except Exception as ex:
+        print("set_user_menu:", ex)
+
 class SubGate(BaseMiddleware):
     async def __call__(self, handler, event, data):
         bot = data.get("bot")
         user = data.get("event_from_user")
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
-            if await is_subscribed(bot, user.id):
+            ok = await is_subscribed(bot, user.id)
+            await set_user_menu(bot, user.id, ok)
+            if ok:
                 await event.answer("Готово! Доступ открыт ✅")
                 try:
                     await event.message.edit_text(
@@ -368,13 +385,16 @@ class SubGate(BaseMiddleware):
             else:
                 await event.answer("Пока не вижу подписку. Подпишитесь и нажмите ещё раз.", show_alert=True)
             return
-        if user and not await is_subscribed(bot, user.id):
-            if isinstance(event, CallbackQuery):
-                await event.answer()
-                await event.message.answer(GATE_TEXT, reply_markup=gate_kb())
-            else:
-                await event.answer(GATE_TEXT, reply_markup=gate_kb())
-            return
+        if user:
+            ok = await is_subscribed(bot, user.id)
+            await set_user_menu(bot, user.id, ok)
+            if not ok:
+                if isinstance(event, CallbackQuery):
+                    await event.answer()
+                    await event.message.answer(GATE_TEXT, reply_markup=gate_kb())
+                else:
+                    await event.answer(GATE_TEXT, reply_markup=gate_kb())
+                return
         return await handler(event, data)
 
 # ---------- хэндлеры ----------
@@ -491,8 +511,12 @@ async def main():
         BotCommand(command="express", description="Экспресс дня"),
     ])
     try:
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE)))
+        if REQUIRED_CHAT:
+            # Гейт включён: глобально убираем кнопку-приложение, подписчикам включим персонально.
+            await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+        else:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE)))
     except Exception as ex:
         print("Не удалось задать кнопку-меню:", ex)
     await start_web()
