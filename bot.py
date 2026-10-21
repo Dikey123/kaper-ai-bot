@@ -112,7 +112,7 @@ def find_match(data, tid, idx):
 # ---------- экранчики ----------
 def main_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📱 Открыть приложение", web_app=WebAppInfo(url=BASE))
+    kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=BASE))
     kb.button(text="⚽ Матчи сегодня", callback_data="today")
     kb.button(text="🏆 Рейтинг", callback_data="rating")
     kb.button(text="⚡ Экспресс дня", callback_data="express")
@@ -417,7 +417,7 @@ async def start(msg: Message):
 @dp.message(Command("app"))
 async def cmd_app(msg: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📱 Открыть приложение", web_app=WebAppInfo(url=BASE))
+    kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=BASE))
     await msg.answer("Открыть «Капер ИИ» как приложение — на весь экран:", reply_markup=kb.as_markup())
 
 @dp.message(Command("today"))
