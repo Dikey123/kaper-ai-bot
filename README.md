@@ -30,14 +30,21 @@ python bot.py
 
 ## Деплой на хостинг (always-on), чтобы бот работал 24/7
 
-### Вариант A — Railway / Render (просто, есть бесплатный тариф)
-1. Залить папку `bot/` в отдельный GitHub-репозиторий.
-2. Создать сервис из этого репозитория (тип: Worker/Background).
-3. В настройках сервиса добавить переменную окружения `BOT_TOKEN`.
-4. Команда запуска: `python bot.py`.
-Минус бесплатных тарифов — сервис может «засыпать»; для рассылок позже нужен VPS или платный тариф.
+### Вариант A — Render (бесплатно, через веб-интерфейс)
+1. render.com → New → **Web Service** → подключить GitHub-репозиторий `kaper-ai-bot`.
+2. Runtime: **Python**. Build Command: `pip install -r requirements.txt`.
+   Start Command: `python bot.py`.
+3. В разделе **Environment** добавить переменную `BOT_TOKEN` = токен бота.
+4. Create Web Service.
+Бот встроенно поднимает мини веб-сервер (health-check на `/`), поэтому Render
+видит его как живой сервис. Бесплатный Render «засыпает» без входящих запросов —
+поэтому настройте бесплатный пингер (cron-job.org / UptimeRobot), который раз в
+10–14 минут открывает URL сервиса. Это держит бота всегда онлайн.
 
-### Вариант B — VPS (стабильно, ~200–400 ₽/мес)
+### Вариант B — Railway (когда их сборки снова работают)
+New Project → Deploy from GitHub repo → добавить переменную `BOT_TOKEN` → Deploy.
+
+### Вариант C — VPS (стабильно, ~200–400 ₽/мес)
 ```bash
 pip install -r requirements.txt
 BOT_TOKEN=ТВОЙ_ТОКЕН python bot.py

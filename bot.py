@@ -14,6 +14,7 @@
 """
 import os, time, re, asyncio, html, random
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, BotCommand
@@ -360,6 +361,21 @@ async def cb_sub(c: CallbackQuery):
     await c.message.edit_text(txt, reply_markup=kb.as_markup(), disable_web_page_preview=True)
     await c.answer()
 
+# ---------- мини веб-сервер (для хостингов типа Render, чтобы сервис считался живым) ----------
+async def _health(request):
+    return web.Response(text="Капер ИИ — бот работает. 18+")
+
+async def start_web():
+    port = int(os.environ.get("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/health", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Веб-сервер слушает порт {port} (health-check)")
+
 async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands([
@@ -368,6 +384,7 @@ async def main():
         BotCommand(command="rating", description="Рейтинг прогнозистов"),
         BotCommand(command="express", description="Экспресс дня"),
     ])
+    await start_web()
     print("Бот запущен (polling)…")
     await dp.start_polling(bot)
 
