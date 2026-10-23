@@ -216,7 +216,7 @@ def opinion_block(src, emoji, name):
     return out
 
 def odds_summary(match):
-    """Краткие котировки и их открытые источники для карточек и поста дня."""
+    """Котировки 1X2 без списка букмекеров."""
     odds = match.get("odds") or []
     if not any(value not in (None, "") for value in odds):
         return ""
@@ -227,20 +227,13 @@ def odds_summary(match):
             return "—"
     values = [fmt(odds[i] if i < len(odds) else None) for i in range(3)]
     lines = ["📊 <b>Коэффициенты 1X2</b>: П1 " + values[0] + " · Х " + values[1] + " · П2 " + values[2]]
-    sources = match.get("odds_sources") or []
-    if sources:
-        names = [str(source.get("name") or "Источник") for source in sources[:4]]
-        if len(sources) > 4:
-            names.append(f"+{len(sources) - 4}")
-        lines.append("📚 Источники: " + e(", ".join(names)))
     stamp = match.get("odds_updated") or max(
-        (source.get("updated", "") for source in sources if source.get("updated")),
+        (source.get("updated", "") for source in (match.get("odds_sources") or []) if source.get("updated")),
         default="",
     )
     if stamp:
         lines.append("🕘 Обновлено: " + e(_format_daily_timestamp(stamp)))
     return "\n".join(lines)
-
 
 def screen_match(t, m, res=None):
     lines = [f"<b>{e(m['home'])} — {e(m['away'])}</b>",
@@ -367,57 +360,211 @@ def parse_k(k):
     except Exception:
         return None
 
-def express(data, n=4):
-    import datetime
-    cands = []
-    for t, i, m in all_matches(data):
-        if m.get("status") != "full":
-            continue
-        o = m.get("odds") or []
-        if o and o[0] is not None and (len(o) < 3 or o[2] is None or o[0] <= o[2]):
-            cands.append({"m": m, "pick": f"Победа «{m['home']}»", "odd": float(o[0]), "mk": "Исход", "tour": t.get("short","")})
-        elif len(o) >= 3 and o[2] is not None:
-            cands.append({"m": m, "pick": f"Победа «{m['away']}»", "odd": float(o[2]), "mk": "Исход", "tour": t.get("short","")})
-        seen = set()
-        for tp in m.get("tips", []):
-            k = parse_k(tp.get("k"))
-            if not k:
-                continue
-            key = re.sub(r"\s+", "", str(tp.get("pick","")).lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            mk = mkt(tp.get("pick",""))
-            if mk == "Ставка":  # неясный рынок — в экспресс не берём
-                continue
-            cands.append({"m": m, "pick": tp.get("pick",""), "odd": k, "mk": mk, "tour": t.get("short","")})
-    cands.sort(key=lambda c: c["odd"])
-    uM, uT, sel = set(), set(), []
-    for c in cands:
-        if len(sel) >= n: break
-        mid = c["m"]["home"] + c["m"]["away"]
-        if mid in uM or c["mk"] in uT: continue
-        uM.add(mid); uT.add(c["mk"]); sel.append(c)
-    if len(sel) < n:
-        for c in cands:
-            if len(sel) >= n: break
-            mid = c["m"]["home"] + c["m"]["away"]
-            if mid in uM: continue
-            uM.add(mid); sel.append(c)
-    return sel
+def _pick_key(pick, match=None):
+    """Нормализует прогноз до рынка, чтобы не подставлять цену от другого исхода."""
+    raw = str(pick or "").strip().lower().replace("ё", "е")
+    norm = re.sub(r"\s+", " ", raw.replace("х", "x"))
+    if not norm:
+        return None
 
-def screen_express(data):
-    sel = express(data, 4)
-    if len(sel) < 2:
-        return "Пока недостаточно матчей с коэффициентами для экспресса. Загляните ближе к игровому дню."
+    if re.search(r"(?<!\d)1\s*x(?!\d)|двойн.*1\s*x|1\s*х", raw) or ("не проигра" in raw and "хозя" in raw):
+        return "dc_1x"
+    if re.search(r"(?<!\d)x\s*2(?!\d)|двойн.*x\s*2|х\s*2", norm) or ("не проигра" in raw and ("гост" in raw or "выезд" in raw)):
+        return "dc_x2"
+    if re.search(r"(?<!\d)1\s*2(?!\d)", norm) or "двойн шанс 12" in norm:
+        return "dc_12"
+
+    if "обе заб" in raw or re.search(r"(?<![а-я])оз(?![а-я])", raw):
+        return "btts_no" if re.search(r"\b(нет|no)\b|не забьют|оз нет", raw) else "btts_yes"
+
+    total_side = None
+    if re.search(r"\b(тб|больше|over)\b", norm) or "тотал больше" in norm:
+        total_side = "over"
+    elif re.search(r"\b(тм|меньше|under)\b", norm) or "тотал меньше" in norm:
+        total_side = "under"
+    if total_side:
+        match_line = re.search(r"(?:тб|тм|больше|меньше|over|under|тотал\s+(?:больше|меньше))\s*([0-9]+(?:[.,][0-9]+)?)", norm)
+        line = match_line.group(1).replace(",", ".") if match_line else ""
+        return f"total_{total_side}_{line}"
+
+    if "ничья" in raw or "draw" in raw or re.fullmatch(r"[xх]", raw):
+        return "result_x"
+    if re.search(r"\bп1\b", norm) or "победа хозяев" in raw or (match and match.get("home") and "победа" in raw and str(match["home"]).lower() in raw):
+        return "result_1"
+    if re.search(r"\bп2\b", norm) or "победа гостей" in raw or (match and match.get("away") and "победа" in raw and str(match["away"]).lower() in raw):
+        return "result_2"
+    return None
+
+
+def _valid_decimal(value):
+    try:
+        number = float(str(value).replace(",", "."))
+        return number if 1.01 < number < 30 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _explicit_pick_price(pick):
+    text = str(pick or "")
+    found = re.search(r"(≈|~|кф\\.?|коэффициент(?:ом)?\\s*)\\s*([0-9]+(?:[.,][0-9]+)?)", text, re.I)
+    if not found:
+        return None, False
+    price = _valid_decimal(found.group(2))
+    return price, bool(price and found.group(1) in ("≈", "~"))
+
+
+def _price_for_pick(match, pick):
+    """Возвращает (коэффициент, расчётный), только для совпадающего рынка."""
+    price, estimated = _explicit_pick_price(pick)
+    if price:
+        return price, estimated
+
+    key = _pick_key(pick, match)
+    tip_prices = []
+    for tip in (match.get("tips") or []):
+        if key and _pick_key(tip.get("pick"), match) == key:
+            value = _valid_decimal(tip.get("k"))
+            if value:
+                tip_prices.append(value)
+    if tip_prices:
+        return max(tip_prices), False
+
+    odds = match.get("odds") or []
+    if key in ("result_1", "result_x", "result_2"):
+        index = {"result_1": 0, "result_x": 1, "result_2": 2}[key]
+        value = _valid_decimal(odds[index] if index < len(odds) else None)
+        if value:
+            return value, False
+
+    if key in ("dc_1x", "dc_x2", "dc_12") and len(odds) >= 3:
+        indexes = {"dc_1x": (0, 1), "dc_x2": (1, 2), "dc_12": (0, 2)}[key]
+        first = _valid_decimal(odds[indexes[0]])
+        second = _valid_decimal(odds[indexes[1]])
+        if first and second:
+            return 1 / (1 / first + 1 / second), True
+    return None, False
+
+
+def _safe_double_chance(match):
+    """Самый вероятный двойной шанс по рынку 1X2; точная котировка берётся из tip, если есть."""
+    odds = match.get("odds") or []
+    p1 = _valid_decimal(odds[0] if len(odds) > 0 else None)
+    px = _valid_decimal(odds[1] if len(odds) > 1 else None)
+    p2 = _valid_decimal(odds[2] if len(odds) > 2 else None)
+
+    if p1 and px and p2:
+        key = "dc_1x" if p1 <= p2 else "dc_x2"
+        label = "1Х (хозяева не проиграют)" if key == "dc_1x" else "Х2 (гости не проиграют)"
+        price, estimated = _price_for_pick(match, label)
+        return (label, price, estimated) if price else (None, None, False)
+
+    # Если 1X2 не пришли, используем опубликованную котировку двойного шанса.
+    options = []
+    for tip in (match.get("tips") or []):
+        key = _pick_key(tip.get("pick"), match)
+        price = _valid_decimal(tip.get("k"))
+        if key in ("dc_1x", "dc_x2") and price:
+            options.append((price, str(tip.get("pick") or ""), False))
+    if options:
+        price, label, _ = min(options, key=lambda item: item[0])
+        return label, price, False
+    return None, None, False
+
+
+def parse_k(k):
+    return _valid_decimal(k)
+
+
+def _upcoming_today(match, today, res=None):
+    if match.get("date") != today or score_for_match(match, res):
+        return False
+    if match.get("ft") or match.get("score"):
+        return False
+    time_text = str(match.get("time") or "")
+    found = re.search(r"\\b([0-2]?\\d):([0-5]\\d)\\b", time_text)
+    if found:
+        zone = datetime.timezone(datetime.timedelta(hours=3))
+        kickoff = datetime.datetime.combine(
+            datetime.date.fromisoformat(today),
+            datetime.time(int(found.group(1)), int(found.group(2))),
+            tzinfo=zone,
+        )
+        if kickoff <= datetime.datetime.now(zone):
+            return False
+    return True
+
+
+def express(data, n=3, res=None, today=None):
+    if not data:
+        return []
+    today = today or data.get("today") or datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=3))
+    ).date().isoformat()
+    candidates = []
+    for tournament, _, match in all_matches(data):
+        if not _upcoming_today(match, today, res):
+            continue
+        label, price, estimated = _safe_double_chance(match)
+        if not label or not price:
+            continue
+        odds = match.get("odds") or []
+        p1 = _valid_decimal(odds[0] if len(odds) > 0 else None)
+        p2 = _valid_decimal(odds[2] if len(odds) > 2 else None)
+        market_probability = (1 / price) if estimated else (1 / price)
+        candidates.append({
+            "m": match,
+            "pick": label,
+            "odd": price,
+            "estimated": estimated,
+            "mk": "Двойной шанс",
+            "tour": tournament.get("short") or tournament.get("name", ""),
+            "probability": market_probability,
+            "ai_confidence": max(
+                int((match.get("ai") or {}).get("conf", 0) or 0),
+                int((match.get("gpt") or {}).get("conf", 0) or 0),
+            ),
+        })
+
+    # Берём матчи с более высокой вероятностью события и не повторяем одну игру.
+    candidates.sort(key=lambda item: (-item["probability"], -item["ai_confidence"], item["m"].get("time") or "99:99"))
+    selected, seen = [], set()
+    for item in candidates:
+        key = (item["m"].get("date"), item["m"].get("home"), item["m"].get("away"))
+        if key in seen:
+            continue
+        selected.append(item)
+        seen.add(key)
+        if len(selected) >= n:
+            break
+    return selected
+
+
+def _format_pick_price(item):
+    marker = "≈" if item.get("estimated") else ""
+    return f"{marker}{item['odd']:.2f}"
+
+
+def screen_express(data, res=None, today=None):
+    sel = express(data, 3, res=res, today=today)
+    if len(sel) < 3:
+        return "⚡ <b>Экспресс дня — 3 события</b>\\nПока недостаточно матчей с доступными коэффициентами двойного шанса. Экспресс появится, когда будут котировки минимум на три предстоящих матча."
+
     total = 1.0
-    out = ["⚡ <b>Экспресс дня от ИИ</b>\n<i>Самые вероятные события разных рынков</i>\n"]
-    for c in sel:
-        total *= c["odd"]
-        out.append(f"• <b>{e(c['m']['home'])} — {e(c['m']['away'])}</b> ({e(c['tour'])})\n  {e(c['mk'])}: {e(c['pick'])} — кф <b>{c['odd']:.2f}</b>")
-    out.append(f"\n<b>Итоговый коэффициент: {total:.2f}</b>  ·  1000 ₽ → {round(total*1000)} ₽")
-    out.append("<i>Должны сыграть все события. Аналитика, не гарантия. 18+</i>")
-    return "\n".join(out)
+    out = [
+        "⚡ <b>Экспресс дня — 3 события</b>",
+        "<i>Выбраны наиболее вероятные двойные шансы по котировкам 1X2. ≈ — расчётный коэффициент.</i>",
+    ]
+    for index, item in enumerate(sel, 1):
+        total *= item["odd"]
+        out.append(
+            f"\\n{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
+            f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\\n"
+            f"   Выбор: <b>{e(item['pick'])}</b> — кф <b>{_format_pick_price(item)}</b>"
+        )
+    total_marker = "≈" if any(item.get("estimated") for item in sel) else ""
+    out.append(f"\\n<b>Общий коэффициент: {total_marker}{total:.2f}</b>")
+    out.append("<i>Вероятность экспресса ниже вероятности каждого отдельного события. Аналитика, не гарантия. 18+</i>")
+    return "\\n".join(out)
 
 # ---------- обязательная подписка на канал/группу ----------
 async def is_subscribed(bot, uid):
@@ -664,12 +811,10 @@ def _format_daily_timestamp(value):
 
 
 def _daily_model_candidates(data, res, today):
-    """Выбирает прогнозы ИИ только на сегодняшние матчи, которые ещё не завершились."""
+    """Подбирает актуальные прогнозы ИИ с коэффициентом на тот же рынок."""
     candidates = []
     for tournament, _, match in all_matches(data):
-        if match.get("date") != today:
-            continue
-        if match.get("ft") or match.get("score") or score_for_match(match, res):
+        if not _upcoming_today(match, today, res):
             continue
         opinions = []
         for key, label in (("ai", "ИИ"), ("gpt", "ChatGPT")):
@@ -692,72 +837,102 @@ def _daily_model_candidates(data, res, today):
             })
         if not opinions:
             continue
+
         opinion = max(opinions, key=lambda item: (item["confidence"], item["model"] == "ИИ"))
+        selected_bet = opinion["bet"]
+        price, estimated = _price_for_pick(match, selected_bet)
+        fallback = False
+        if not price:
+            safe_pick, safe_price, safe_estimated = _safe_double_chance(match)
+            if not safe_price:
+                continue
+            selected_bet, price, estimated = safe_pick, safe_price, safe_estimated
+            fallback = True
+
         probability = re.search(r"\b(100|[1-9]?\d)\s*%", opinion["text"])
+        try:
+            probability_value = float(probability.group(1)) / 100 if probability else 0
+        except (TypeError, ValueError):
+            probability_value = 0
         candidates.append({
             "home": match.get("home", ""),
             "away": match.get("away", ""),
             "time": match.get("time", ""),
             "tournament": tournament.get("name", ""),
+            "short_tournament": tournament.get("short") or tournament.get("name", ""),
             "experts": len(match.get("tips") or []),
             "probability": probability.group(1) if probability else "",
-            "odds": match.get("odds") or [],
-            "odds_sources": match.get("odds_sources") or [],
-            "odds_updated": match.get("odds_updated") or "",
-            **opinion,
+            "probability_value": probability_value,
+            "confidence": opinion["confidence"],
+            "model": opinion["model"],
+            "score": opinion["score"],
+            "text": opinion["text"],
+            "bet": selected_bet,
+            "coefficient": price,
+            "coefficient_estimated": estimated,
+            "fallback": fallback,
+            "match": match,
         })
     candidates.sort(key=lambda item: (
-        -item["confidence"], -item["experts"], item["time"] or "99:99", item["home"]
+        -item["confidence"],
+        -item["probability_value"],
+        -(1 / item["coefficient"]),
+        -item["experts"],
+        item["time"] or "99:99",
     ))
     return candidates
 
 
 def _daily_predictions_block(data, res, today):
     candidates = _daily_model_candidates(data, res, today)
-    if not candidates:
-        return "🎯 <b>Лучший прогноз дня от ИИ</b>\nПока нет подготовленных ИИ-прогнозов на сегодняшние матчи."
+    out = []
+    if candidates:
+        best = candidates[0]
+        meta = []
+        if best["score"]:
+            meta.append(f"счёт ИИ {e(best['score'])}")
+        if best["probability"]:
+            meta.append(f"оценка модели {best['probability']}%")
+        elif best["confidence"]:
+            meta.append(f"уверенность {best['confidence']}/5")
+        if best["time"]:
+            meta.append(e(best["time"]))
+        suffix = " · " + " · ".join(meta) if meta else ""
+        title = "Выбор ИИ" if not best["fallback"] else "Осторожный выбор по котировкам для прогноза ИИ"
+        price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
+        out.extend([
+            f"🎯 <b>Лучший прогноз дня</b>",
+            f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
+            f"{title}: <b>{e(best['bet'])}</b> — кф <b>{price}</b>{suffix}",
+        ])
+    else:
+        out.extend([
+            "🎯 <b>Прогноз дня</b>",
+            "Пока нет прогноза на предстоящий матч с проверяемым коэффициентом.",
+        ])
 
-    best = candidates[0]
-    meta = []
-    if best["score"]:
-        meta.append(f"счёт {e(best['score'])}")
-    if best["probability"]:
-        meta.append(f"оценка модели {best['probability']}%")
-    if best["confidence"]:
-        meta.append(f"уверенность {best['confidence']}/5")
-    if best["time"]:
-        meta.append(e(best["time"]))
-    details = " · ".join(meta)
-
-    out = [
-        "🎯 <b>Лучший прогноз дня от ИИ</b>",
-        f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
-        f"Выбор: <b>{e(best['bet'])}</b>" + (f" · {details}" if details else ""),
-    ]
-    quote_block = odds_summary(best)
-    if quote_block:
-        out.append(quote_block)
-    additional = candidates[1:3]
-    if additional:
-        out.append("\n📌 <b>Ещё прогнозы ИИ</b>")
-        for item in additional:
-            extra = []
-            if item["score"]:
-                extra.append(f"счёт {e(item['score'])}")
-            if item["confidence"]:
-                extra.append(f"уверенность {item['confidence']}/5")
-            if item["time"]:
-                extra.append(e(item["time"]))
-            suffix = " · " + " · ".join(extra) if extra else ""
+    today_value = data.get("today") or today
+    legs = express(data, 3, res=res, today=today_value)
+    if len(legs) == 3:
+        total = 1.0
+        out.append("\\n⚡ <b>Экспресс дня — 3 события</b>")
+        for index, item in enumerate(legs, 1):
+            total *= item["odd"]
+            price = _format_pick_price(item)
             out.append(
-                f"• <b>{e(item['home'])} — {e(item['away'])}</b>: "
-                f"{e(item['bet'])}{suffix}"
+                f"{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
+                f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\\n"
+                f"   {e(item['pick'])} — кф <b>{price}</b>"
             )
-            quote_block = odds_summary(item)
-            if quote_block:
-                out.append("  " + quote_block.replace("\n", "\n  "))
-    return "\n".join(out)
-
+        marker = "≈" if any(item.get("estimated") for item in legs) else ""
+        out.append(f"<b>Общий коэффициент: {marker}{total:.2f}</b>")
+        if any(item.get("estimated") for item in legs):
+            out.append("<i>≈ — расчётный коэффициент двойного шанса по котировкам 1X2, не прямая котировка букмекера.</i>")
+    else:
+        out.append("\\n⚡ <b>Экспресс дня — 3 события</b>")
+        out.append("Сегодня пока нет коэффициентов минимум на три предстоящих матча, поэтому непроверенные цены не публикуем.")
+    out.append("<i>Экспресс рискованнее одиночного события: должны пройти все три выбора. 18+</i>")
+    return "\\n".join(out)
 
 def _daily_rating_block(res):
     """Показывает текущую проходимость источников и моделей по закрытым прогнозам."""
