@@ -1171,7 +1171,7 @@ def _score_for_daily_pick(pick, data, res):
                 and _history_norm_team(result.get("away")) == away):
             score = result.get("score") or result.get("ft")
             if score:
-                return re.sub(r"\\s*[-:]\\s*", ":", str(score)).strip()
+                return re.sub(r"\s*[-:]\s*", ":", str(score)).strip()
     return ""
 
 
@@ -1184,7 +1184,7 @@ def _settle_daily_pick_token(pick, home_goals, away_goals, home, away):
         yes = not any(word in text for word in ("нет", "не заб", "no"))
         return "win" if ((home_goals > 0 and away_goals > 0) == yes) else "lose"
 
-    total_line = re.search(r"(?:тотал\\s*(?:больше|меньше)|т[бм]|over|under|больше|меньше)\\s*[:(]?\\s*(\\d+(?:\\.\\d+)?)", text)
+    total_line = re.search(r"(?:тотал\s*(?:больше|меньше)|т[бм]|over|under|больше|меньше)\s*[:(]?\s*(\d+(?:\.\d+)?)", text)
     if total_line:
         line = float(total_line.group(1))
         over = any(word in text for word in ("тб", "больше", "over"))
@@ -1192,23 +1192,23 @@ def _settle_daily_pick_token(pick, home_goals, away_goals, home, away):
             return "push"
         return "win" if ((total > line) == over) else "lose"
 
-    handicap = re.search(r"(?:фора\\s*1|ф1)\\s*\\(?\\s*([+-]?\\d+(?:\\.\\d+)?)", text)
+    handicap = re.search(r"(?:фора\s*1|ф1)\s*\(?\s*([+-]?\d+(?:\.\d+)?)", text)
     if handicap:
         adjusted = home_goals + float(handicap.group(1)) - away_goals
         return "push" if adjusted == 0 else ("win" if adjusted > 0 else "lose")
-    handicap = re.search(r"(?:фора\\s*2|ф2)\\s*\\(?\\s*([+-]?\\d+(?:\\.\\d+)?)", text)
+    handicap = re.search(r"(?:фора\s*2|ф2)\s*\(?\s*([+-]?\d+(?:\.\d+)?)", text)
     if handicap:
         adjusted = away_goals + float(handicap.group(1)) - home_goals
         return "push" if adjusted == 0 else ("win" if adjusted > 0 else "lose")
 
-    if re.search(r"(?<![a-zа-я0-9])1\\s*x(?![a-zа-я0-9])", text):
+    if re.search(r"(?<![a-zа-я0-9])1\s*x(?![a-zа-я0-9])", text):
         return "win" if outcome in ("1", "x") else "lose"
-    if re.search(r"(?<![a-zа-я0-9])x\\s*2(?![a-zа-я0-9])", text):
+    if re.search(r"(?<![a-zа-я0-9])x\s*2(?![a-zа-я0-9])", text):
         return "win" if outcome in ("x", "2") else "lose"
-    if re.search(r"(?<![a-zа-я0-9])1\\s*2(?![a-zа-я0-9])", text):
+    if re.search(r"(?<![a-zа-я0-9])1\s*2(?![a-zа-я0-9])", text):
         return "win" if outcome in ("1", "2") else "lose"
 
-    exact = re.search(r"(\\d+)\\s*:\\s*(\\d+)", text)
+    exact = re.search(r"(\d+)\s*:\s*(\d+)", text)
     if exact and ("счет" in text or "точный" in text):
         return "win" if (int(exact.group(1)) == home_goals and int(exact.group(2)) == away_goals) else "lose"
 
@@ -1235,7 +1235,7 @@ def _settle_daily_pick_token(pick, home_goals, away_goals, home, away):
 
 
 def _settle_daily_pick(pick, score):
-    score_match = re.match(r"\\s*(\\d+)\\s*[:\\-]\\s*(\\d+)", str(score or ""))
+    score_match = re.match(r"\s*(\d+)\s*[:\-]\s*(\d+)", str(score or ""))
     if not score_match:
         return None
     return _settle_daily_pick_token(
