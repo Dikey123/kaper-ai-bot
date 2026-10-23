@@ -1036,7 +1036,7 @@ async def post_daily(bot):
     print(f"Ежедневный пост отправлен: {today}, матчей {len(rows)}.")
     return True
 
-POST_TIMES = [(10, 15)]  # часы:минуты МСК для авто-постов в канал
+POST_TIMES = [(12, 30)]  # публикуем после сбора прогнозов в 12:00 МСК
 async def channel_poster(bot):
     if not REQUIRED_CHAT:
         return
