@@ -406,7 +406,7 @@ def _valid_decimal(value):
 
 def _explicit_pick_price(pick):
     text = str(pick or "")
-    found = re.search(r"(≈|~|кф\\.?|коэффициент(?:ом)?\\s*)\\s*([0-9]+(?:[.,][0-9]+)?)", text, re.I)
+    found = re.search(r"(≈|~|кф\.?|коэффициент(?:ом)?\s*)\s*([0-9]+(?:[.,][0-9]+)?)", text, re.I)
     if not found:
         return None, False
     price = _valid_decimal(found.group(2))
@@ -481,7 +481,7 @@ def _upcoming_today(match, today, res=None):
     if match.get("ft") or match.get("score"):
         return False
     time_text = str(match.get("time") or "")
-    found = re.search(r"\\b([0-2]?\\d):([0-5]\\d)\\b", time_text)
+    found = re.search(r"\b([0-2]?\d):([0-5]\d)\b", time_text)
     if found:
         zone = datetime.timezone(datetime.timedelta(hours=3))
         kickoff = datetime.datetime.combine(
@@ -547,7 +547,7 @@ def _format_pick_price(item):
 def screen_express(data, res=None, today=None):
     sel = express(data, 3, res=res, today=today)
     if len(sel) < 3:
-        return "⚡ <b>Экспресс дня — 3 события</b>\\nПока недостаточно матчей с доступными коэффициентами двойного шанса. Экспресс появится, когда будут котировки минимум на три предстоящих матча."
+        return "⚡ <b>Экспресс дня — 3 события</b>\nПока недостаточно матчей с доступными коэффициентами двойного шанса. Экспресс появится, когда будут котировки минимум на три предстоящих матча."
 
     total = 1.0
     out = [
@@ -557,14 +557,14 @@ def screen_express(data, res=None, today=None):
     for index, item in enumerate(sel, 1):
         total *= item["odd"]
         out.append(
-            f"\\n{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
-            f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\\n"
+            f"\n{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
+            f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\n"
             f"   Выбор: <b>{e(item['pick'])}</b> — кф <b>{_format_pick_price(item)}</b>"
         )
     total_marker = "≈" if any(item.get("estimated") for item in sel) else ""
-    out.append(f"\\n<b>Общий коэффициент: {total_marker}{total:.2f}</b>")
+    out.append(f"\n<b>Общий коэффициент: {total_marker}{total:.2f}</b>")
     out.append("<i>Вероятность экспресса ниже вероятности каждого отдельного события. Аналитика, не гарантия. 18+</i>")
-    return "\\n".join(out)
+    return "\n".join(out)
 
 # ---------- обязательная подписка на канал/группу ----------
 async def is_subscribed(bot, uid):
@@ -915,13 +915,13 @@ def _daily_predictions_block(data, res, today):
     legs = express(data, 3, res=res, today=today_value)
     if len(legs) == 3:
         total = 1.0
-        out.append("\\n⚡ <b>Экспресс дня — 3 события</b>")
+        out.append("\n⚡ <b>Экспресс дня — 3 события</b>")
         for index, item in enumerate(legs, 1):
             total *= item["odd"]
             price = _format_pick_price(item)
             out.append(
                 f"{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
-                f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\\n"
+                f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\n"
                 f"   {e(item['pick'])} — кф <b>{price}</b>"
             )
         marker = "≈" if any(item.get("estimated") for item in legs) else ""
@@ -929,10 +929,10 @@ def _daily_predictions_block(data, res, today):
         if any(item.get("estimated") for item in legs):
             out.append("<i>≈ — расчётный коэффициент двойного шанса по котировкам 1X2, не прямая котировка букмекера.</i>")
     else:
-        out.append("\\n⚡ <b>Экспресс дня — 3 события</b>")
+        out.append("\n⚡ <b>Экспресс дня — 3 события</b>")
         out.append("Сегодня пока нет коэффициентов минимум на три предстоящих матча, поэтому непроверенные цены не публикуем.")
     out.append("<i>Экспресс рискованнее одиночного события: должны пройти все три выбора. 18+</i>")
-    return "\\n".join(out)
+    return "\n".join(out)
 
 def _daily_rating_block(res):
     """Показывает текущую проходимость источников и моделей по закрытым прогнозам."""
