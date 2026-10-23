@@ -64,7 +64,7 @@ def ai_probability(opinion):
 def ai_bet_eligible(opinion):
     return (
         isinstance(opinion, dict)
-        and opinion.get("eligible") is not False
+        and opinion.get("eligible") is True
         and ai_probability(opinion) is not None
         and ai_probability(opinion) >= AI_MIN_PROBABILITY
         and bool(str(opinion.get("bet") or opinion.get("pick") or "").strip())
