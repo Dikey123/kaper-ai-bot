@@ -1310,19 +1310,21 @@ def _daily_results_block(history, yesterday, data, res):
         reports = [_settled_pick_report(leg, data, res, f"Экспресс {index}/3", show_cash=False) for index, leg in enumerate(express_legs, 1)]
         lines.extend(item["line"] for item in reports)
         states = [item.get("state") for item in reports]
-        if all(state in ("win", "lose", "push") for state in states):
-            if "lose" in states:
-                payout, net, result_text = 0, -1000, "❌ ЭКСПРЕСС НЕ ЗАШЁЛ"
-            else:
-                effective_coefficient = 1.0
-                for leg, state in zip(express_legs, states):
-                    if state == "win":
-                        effective_coefficient *= float(leg["coefficient"])
-                payout = round(1000 * effective_coefficient)
-                net = payout - 1000
-                result_text = "✅ ЭКСПРЕСС ЗАШЁЛ"
+        if "lose" in states:
+            payout, net, result_text = 0, -1000, "❌ ЭКСПРЕСС НЕ ЗАШЁЛ"
             lines.append(
                 f"{result_text}: ставка 1 000 ₽ → выплата {_rubles(payout)}, "
+                f"чистый итог {_signed_rubles(net)}."
+            )
+        elif all(state in ("win", "push") for state in states):
+            effective_coefficient = 1.0
+            for leg, state in zip(express_legs, states):
+                if state == "win":
+                    effective_coefficient *= float(leg["coefficient"])
+            payout = round(1000 * effective_coefficient)
+            net = payout - 1000
+            lines.append(
+                f"✅ ЭКСПРЕСС ЗАШЁЛ: ставка 1 000 ₽ → выплата {_rubles(payout)}, "
                 f"чистый итог {_signed_rubles(net)}."
             )
         else:
