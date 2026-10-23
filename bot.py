@@ -58,7 +58,7 @@ def ai_probability(opinion):
             return value if 0 <= value <= 100 else None
     except (TypeError, ValueError):
         pass
-    match = re.search(r"(?<!\\d)(100|[1-9]?\\d)\\s*%", str(opinion.get("text") or ""))
+    match = re.search(r"(?<!\d)(100|[1-9]?\d)\s*%", str(opinion.get("text") or ""))
     return int(match.group(1)) if match else None
 
 def ai_bet_eligible(opinion):
@@ -229,20 +229,20 @@ def opinion_block(src, emoji, name, match=None):
     if not src:
         return ""
     if not ai_bet_eligible(src):
-        return f"\\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с подтверждённой оценкой от 75%."
+        return f"\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с подтверждённой оценкой от 75%."
     probability = ai_probability(src)
-    out = f"\\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\\n{e(src.get('text',''))}"
+    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
     bet = str(src.get("bet") or src.get("pick") or "").strip()
     if match:
         price, estimated = _price_for_pick(match, bet)
         if price:
             marker = "≈" if estimated else ""
-            out += f"\\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
+            out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
         else:
-            out += f"\\nСтавка {name}: <b>{e(bet)}</b> — оценка модели {probability}%; коэффициент не найден."
+            out += f"\nСтавка {name}: <b>{e(bet)}</b> — оценка модели {probability}%; коэффициент не найден."
     sources = [s for s in (src.get("sources") or []) if isinstance(s, dict) and str(s.get("url") or "").startswith(("https://", "http://"))][:4]
     if sources:
-        out += "\\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
+        out += "\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
     return out
 
 def odds_summary(match):
@@ -365,13 +365,13 @@ def screen_rating(res):
         rows.append({"src": label, "reg": "ai", "win": wins, "lose": losses,
                      "pct": round(wins/n*100) if n else 0, "w": wilson(wins,n), "n": n, "ai": True})
     rows.sort(key=lambda r: (-r["w"], -r["n"], -r["pct"]))
-    out = [f"🏆 <b>Рейтинг прогнозистов</b>\\n<i>% по {res.get('matches',0)} сыгранным матчам; ИИ считается отдельно только для новых ставок от 75%</i>\\n"]
+    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; ИИ считается отдельно только для новых ставок от 75%</i>\n"]
     for i, r in enumerate(rows[:25], 1):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
         out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{r['pct']}%</b> ({r['win']}–{r['lose']}{small})")
-    out.append("\\n<i>Прошлые результаты не гарантируют будущие. 18+</i>")
-    return "\\n".join(out)
+    out.append("\n<i>Прошлые результаты не гарантируют будущие. 18+</i>")
+    return "\n".join(out)
 
 # ---------- экспресс ----------
 def mkt(pick):
