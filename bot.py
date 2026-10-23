@@ -215,6 +215,33 @@ def opinion_block(src, emoji, name):
         out += f"\nВыбор {name}: <b>{e(src['bet'])}</b>  (уверенность {dots})"
     return out
 
+def odds_summary(match):
+    """Краткие котировки и их открытые источники для карточек и поста дня."""
+    odds = match.get("odds") or []
+    if not any(value not in (None, "") for value in odds):
+        return ""
+    def fmt(value):
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "—"
+    values = [fmt(odds[i] if i < len(odds) else None) for i in range(3)]
+    lines = ["📊 <b>Коэффициенты 1X2</b>: П1 " + values[0] + " · Х " + values[1] + " · П2 " + values[2]]
+    sources = match.get("odds_sources") or []
+    if sources:
+        names = [str(source.get("name") or "Источник") for source in sources[:4]]
+        if len(sources) > 4:
+            names.append(f"+{len(sources) - 4}")
+        lines.append("📚 Источники: " + e(", ".join(names)))
+    stamp = match.get("odds_updated") or max(
+        (source.get("updated", "") for source in sources if source.get("updated")),
+        default="",
+    )
+    if stamp:
+        lines.append("🕘 Обновлено: " + e(_format_daily_timestamp(stamp)))
+    return "\n".join(lines)
+
+
 def screen_match(t, m, res=None):
     lines = [f"<b>{e(m['home'])} — {e(m['away'])}</b>",
              f"{e(t.get('name',''))} · {e(t.get('round',''))}",
@@ -222,10 +249,9 @@ def screen_match(t, m, res=None):
     score = score_for_match(m, res)
     if score:
         lines.append(f"🏁 Итоговый счёт: <b>{e(score)}</b>")
-    o = m.get("odds") or [None, None, None]
-    if any(x is not None for x in o):
-        def f(x): return "—" if x is None else f"{x:.2f}"
-        lines.append(f"\n<b>Коэффициенты</b>: П1 {f(o[0])} · Х {f(o[1])} · П2 {f(o[2])}")
+    quote_block = odds_summary(m)
+    if quote_block:
+        lines.append("\n" + quote_block)
     if m.get("context"):
         lines.append("\n" + e(m["context"]))
     # эксперты
@@ -538,15 +564,11 @@ async def cb_match(c: CallbackQuery):
     t, m = find_match(data, tid, int(idx))
     if not m:
         return await c.answer("Матч не найден", show_alert=True)
-    if m.get("status") != "full":
-        score = score_for_match(m, res)
-        result_line = f"\n🏁 Итоговый счёт: <b>{e(score)}</b>" if score else ""
-        await c.message.edit_text(
-            f"<b>{e(m['home'])} — {e(m['away'])}</b>\n{e(t.get('name',''))}\n🗓 {e(dlabel(m['date']))}, {e(m['time'])}{result_line}\n\n"
-            "Прогнозы, составы и новости появятся в день матча.",
-            reply_markup=InlineKeyboardBuilder().button(text="⬅️ К матчам", callback_data=f"d:{m.get('date', '')}").as_markup())
-        return await c.answer()
-    await c.message.edit_text(screen_match(t, m, res), reply_markup=match_kb(t, int(idx), m), disable_web_page_preview=True)
+    await c.message.edit_text(
+        screen_match(t, m, res),
+        reply_markup=match_kb(t, int(idx), m),
+        disable_web_page_preview=True,
+    )
     await c.answer()
 
 @dp.callback_query(F.data.startswith(("lu:", "nw:", "tp:")))
@@ -628,47 +650,207 @@ BOT_USERNAME = ""
 def bot_link():
     return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else (channel_link() or "https://t.me/")
 
-def _leader_and_ai(res):
-    if not res or not res.get("sources"):
-        return None, None
-    rr = []
-    for src, v in res["sources"].items():
-        n = v["win"] + v["lose"]
-        rr.append((wilson(v["win"], n), src, round(v["win"]/n*100) if n else 0))
-    rr.sort(reverse=True)
-    leader = rr[0] if rr else None
-    ai = res.get("ai", {"win": 0, "lose": 0})
-    an = ai["win"] + ai["lose"]
-    aistat = (round(ai["win"]/an*100), ai["win"], ai["lose"]) if an else None
-    return leader, aistat
+def _format_daily_timestamp(value):
+    if not value:
+        return ""
+    try:
+        stamp = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+        msk = datetime.timezone(datetime.timedelta(hours=3))
+        return stamp.astimezone(msk).strftime("%d.%m %H:%M МСК")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _daily_model_candidates(data, res, today):
+    """Выбирает прогнозы ИИ только на сегодняшние матчи, которые ещё не завершились."""
+    candidates = []
+    for tournament, _, match in all_matches(data):
+        if match.get("date") != today:
+            continue
+        if match.get("ft") or match.get("score") or score_for_match(match, res):
+            continue
+        opinions = []
+        for key, label in (("ai", "ИИ"), ("gpt", "ChatGPT")):
+            opinion = match.get(key)
+            if not isinstance(opinion, dict):
+                continue
+            bet = str(opinion.get("bet") or opinion.get("pick") or "").strip()
+            if not bet:
+                continue
+            try:
+                confidence = max(0, min(5, int(opinion.get("conf", 0) or 0)))
+            except (TypeError, ValueError):
+                confidence = 0
+            opinions.append({
+                "model": label,
+                "bet": bet,
+                "score": str(opinion.get("score") or "").strip(),
+                "text": str(opinion.get("text") or ""),
+                "confidence": confidence,
+            })
+        if not opinions:
+            continue
+        opinion = max(opinions, key=lambda item: (item["confidence"], item["model"] == "ИИ"))
+        probability = re.search(r"\b(100|[1-9]?\d)\s*%", opinion["text"])
+        candidates.append({
+            "home": match.get("home", ""),
+            "away": match.get("away", ""),
+            "time": match.get("time", ""),
+            "tournament": tournament.get("name", ""),
+            "experts": len(match.get("tips") or []),
+            "probability": probability.group(1) if probability else "",
+            "odds": match.get("odds") or [],
+            "odds_sources": match.get("odds_sources") or [],
+            "odds_updated": match.get("odds_updated") or "",
+            **opinion,
+        })
+    candidates.sort(key=lambda item: (
+        -item["confidence"], -item["experts"], item["time"] or "99:99", item["home"]
+    ))
+    return candidates
+
+
+def _daily_predictions_block(data, res, today):
+    candidates = _daily_model_candidates(data, res, today)
+    if not candidates:
+        return "🎯 <b>Лучший прогноз дня от ИИ</b>\nПока нет подготовленных ИИ-прогнозов на сегодняшние матчи."
+
+    best = candidates[0]
+    meta = []
+    if best["score"]:
+        meta.append(f"счёт {e(best['score'])}")
+    if best["probability"]:
+        meta.append(f"оценка модели {best['probability']}%")
+    if best["confidence"]:
+        meta.append(f"уверенность {best['confidence']}/5")
+    if best["time"]:
+        meta.append(e(best["time"]))
+    details = " · ".join(meta)
+
+    out = [
+        "🎯 <b>Лучший прогноз дня от ИИ</b>",
+        f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
+        f"Выбор: <b>{e(best['bet'])}</b>" + (f" · {details}" if details else ""),
+    ]
+    quote_block = odds_summary(best)
+    if quote_block:
+        out.append(quote_block)
+    additional = candidates[1:3]
+    if additional:
+        out.append("\n📌 <b>Ещё прогнозы ИИ</b>")
+        for item in additional:
+            extra = []
+            if item["score"]:
+                extra.append(f"счёт {e(item['score'])}")
+            if item["confidence"]:
+                extra.append(f"уверенность {item['confidence']}/5")
+            if item["time"]:
+                extra.append(e(item["time"]))
+            suffix = " · " + " · ".join(extra) if extra else ""
+            out.append(
+                f"• <b>{e(item['home'])} — {e(item['away'])}</b>: "
+                f"{e(item['bet'])}{suffix}"
+            )
+            quote_block = odds_summary(item)
+            if quote_block:
+                out.append("  " + quote_block.replace("\n", "\n  "))
+    return "\n".join(out)
+
+
+def _daily_rating_block(res):
+    """Показывает текущую проходимость источников и моделей по закрытым прогнозам."""
+    if not res:
+        return "🏆 <b>Рейтинг прогнозистов</b>\nСтатистика пока недоступна."
+
+    sources = []
+    for name, value in (res.get("sources") or {}).items():
+        try:
+            wins = int(value.get("win", 0) or 0)
+            losses = int(value.get("lose", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        total = wins + losses
+        if total:
+            sources.append({
+                "name": name,
+                "wins": wins,
+                "losses": losses,
+                "total": total,
+                "pct": round(wins / total * 100),
+                "wilson": wilson(wins, total),
+            })
+
+    sources.sort(key=lambda row: (-row["wilson"], -row["total"], -row["pct"]))
+    qualified = [row for row in sources if row["total"] >= 3]
+    shown = (qualified or sources)[:3]
+
+    out = ["🏆 <b>Рейтинг прогнозистов</b>"]
+    done = res.get("done")
+    if isinstance(done, list):
+        out.append(f"<i>По {len(done)} матчам с зафиксированным результатом</i>")
+
+    if shown:
+        for index, row in enumerate(shown, 1):
+            note = " · мало данных" if row["total"] < 3 else ""
+            out.append(
+                f"{index}. <b>{e(row['name'])}</b> — {row['pct']}% "
+                f"({row['wins']}–{row['losses']}){note}"
+            )
+    else:
+        out.append("Рейтинг сайтов появится после первых рассчитанных прогнозов.")
+
+    for key, label in (("ai", "ИИ-модель"), ("gpt", "ChatGPT")):
+        value = res.get(key) or {}
+        try:
+            wins = int(value.get("win", 0) or 0)
+            losses = int(value.get("lose", 0) or 0)
+        except (TypeError, ValueError):
+            wins = losses = 0
+        total = wins + losses
+        if total:
+            out.append(
+                f"{'🤖' if key == 'ai' else '🧠'} <b>{label}</b> — "
+                f"{round(wins / total * 100)}% ({wins}–{losses})"
+                + (" · мало данных" if total < 3 else "")
+            )
+        elif key == "ai":
+            out.append("🤖 <b>ИИ-модель</b> — статистика накапливается.")
+    return "\n".join(out)
+
 
 async def post_daily(bot):
     if not REQUIRED_CHAT:
         return False
-    data, res = await get_data()
+    # Для ежедневной публикации обходим кэш бота: берём свежие матчи и рейтинг.
+    data, res = await get_data(force=True)
     if not data:
         return False
     today = data.get("today")
+    if not today:
+        today = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=3))
+        ).date().isoformat()
     rows = [m for (t, i, m) in all_matches(data) if m.get("date") == today]
+
+    parts = [
+        "🔥 <b>Капер ИИ</b> — прогнозы на сегодня",
+        f"⚽ Матчей сегодня: <b>{len(rows)}</b> · {e(dlabel(today))}",
+        f"🔄 Данные обновлены: {e(_format_daily_timestamp(data.get('updated')) or 'время не указано')}",
+        "",
+        _daily_predictions_block(data, res, today),
+        "",
+        _daily_rating_block(res),
+    ]
     if not rows:
-        return False  # нет матчей — не постим
-    parts = ["🔥 <b>Капер ИИ</b> — прогнозы на сегодня",
-             f"⚽ Матчей сегодня: <b>{len(rows)}</b> · {e(dlabel(today))}", ""]
-    parts.append(screen_express(data))
-    leader, aistat = _leader_and_ai(res)
-    tail = []
-    if leader:
-        tail.append(f"🏆 Лидер прогнозистов: <b>{e(leader[1])}</b> — {leader[2]}%")
-    if aistat:
-        tail.append(f"🤖 ИИ: <b>{aistat[0]}%</b> проходимости ({aistat[1]}–{aistat[2]})")
-    if tail:
-        parts.append("\n" + "\n".join(tail))
-    parts.append("\nВсе прогнозы, составы и свой экспресс — в приложении 👇\n<i>18+. Аналитика, не гарантия.</i>")
+        parts.insert(2, "На сегодня матчей нет — опубликовали актуальный рейтинг.")
+    parts.append("\nВсе матчи и подробные прогнозы — в приложении 👇\n<i>18+. Аналитика, не гарантия.</i>")
     kb = InlineKeyboardBuilder()
     kb.button(text="⚽ Открыть в боте", url=bot_link())
     await bot.send_message(REQUIRED_CHAT, "\n".join(parts),
                            reply_markup=kb.as_markup(), disable_web_page_preview=True)
-    print("Пост в канал отправлен.")
+    print(f"Ежедневный пост отправлен: {today}, матчей {len(rows)}.")
     return True
 
 POST_TIMES = [(10, 15)]  # часы:минуты МСК для авто-постов в канал
