@@ -346,30 +346,57 @@ def wilson(w, n):
     p = w / n
     return (p + z*z/(2*n) - z*((p*(1-p)+z*z/(4*n))/n) ** 0.5) / (1 + z*z/n)
 
-def screen_rating(res):
+def rating_kb(page, total_pages):
+    kb = InlineKeyboardBuilder()
+    if page > 0:
+        kb.button(text="⬅️ Предыдущая", callback_data=f"r:{page-1}")
+    if page + 1 < total_pages:
+        kb.button(text="Следующая ➡️", callback_data=f"r:{page+1}")
+    if page > 0 and page + 1 < total_pages:
+        kb.adjust(2, 1)
+    else:
+        kb.adjust(1, 1)
+    kb.button(text="⬅️ Главное меню", callback_data="menu")
+    return kb.as_markup()
+
+def screen_rating(res, page=0):
     if not res:
-        return "Статистика ещё собирается — рейтинг появится после первых сыгранных матчей."
+        return ("Статистика ещё собирается — рейтинг появится после первых сыгранных матчей.", main_kb())
     rows = []
     for src, v in (res.get("sources") or {}).items():
-        n = int(v.get("win", 0) or 0) + int(v.get("lose", 0) or 0)
-        rows.append({"src": src, "reg": v.get("reg","ru"), "win": int(v.get("win",0) or 0),
-                     "lose": int(v.get("lose",0) or 0),
-                     "pct": round(int(v.get("win",0) or 0)/n*100) if n else 0,
-                     "w": wilson(int(v.get("win",0) or 0), n), "n": n})
+        wins, losses = int(v.get("win", 0) or 0), int(v.get("lose", 0) or 0)
+        pushes = int(v.get("push", 0) or 0)
+        n = wins + losses
+        rows.append({"src": src, "reg": v.get("reg","ru"), "win": wins,
+                     "lose": losses, "push": pushes,
+                     "pct": round(wins/n*100) if n else 0,
+                     "w": wilson(wins,n), "n": n})
     for key, label in (("gpt75", "🧠 ChatGPT ≥75%"), ("ai75", "🤖 Claude ≥75%")):
         value = res.get(key) or {"win":0,"lose":0,"push":0}
-        wins, losses = int(value.get("win",0) or 0), int(value.get("lose",0) or 0)
+        wins = int(value.get("win",0) or 0)
+        losses = int(value.get("lose",0) or 0)
+        pushes = int(value.get("push",0) or 0)
         n = wins + losses
         rows.append({"src": label, "reg": "ai", "win": wins, "lose": losses,
-                     "pct": round(wins/n*100) if n else 0, "w": wilson(wins,n), "n": n, "ai": True})
+                     "push": pushes, "pct": round(wins/n*100) if n else 0,
+                     "w": wilson(wins,n), "n": n, "ai": True})
     rows.sort(key=lambda r: (-r["w"], -r["n"], -r["pct"]))
-    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; ИИ считается отдельно только для новых ставок от 75%</i>\n"]
-    for i, r in enumerate(rows[:25], 1):
+    page_size = 15
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    try:
+        page = max(0, min(int(page), total_pages - 1))
+    except (TypeError, ValueError):
+        page = 0
+    first = page * page_size
+    last = min(first + page_size, len(rows))
+    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всего строк: {len(rows)} · страница {page+1}/{total_pages}. ИИ отдельно: только новые ставки от 75%</i>\n"]
+    for i, r in enumerate(rows[first:last], first + 1):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
-        out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{r['pct']}%</b> ({r['win']}–{r['lose']}{small})")
-    out.append("\n<i>Прошлые результаты не гарантируют будущие. 18+</i>")
-    return "\n".join(out)
+        push = f" · пуш {r['push']}" if r["push"] else ""
+        out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{r['pct']}%</b> ({r['win']}–{r['lose']}{push}{small})")
+    out.append("\n<i>Пуши не входят в процент; прошлые результаты не гарантируют будущие. 18+</i>")
+    return "\n".join(out), rating_kb(page, total_pages)
 
 # ---------- экспресс ----------
 def mkt(pick):
@@ -698,7 +725,8 @@ async def cmd_today(msg: Message):
 @dp.message(Command("rating"))
 async def cmd_rating(msg: Message):
     _, res = await get_data()
-    await msg.answer(screen_rating(res), reply_markup=main_kb(), disable_web_page_preview=True)
+    txt, kb = screen_rating(res)
+    await msg.answer(txt, reply_markup=kb, disable_web_page_preview=True)
 
 @dp.message(Command("express"))
 async def cmd_express(msg: Message):
@@ -728,7 +756,19 @@ async def cb_date(c: CallbackQuery):
 @dp.callback_query(F.data == "rating")
 async def cb_rating(c: CallbackQuery):
     _, res = await get_data()
-    await c.message.edit_text(screen_rating(res), reply_markup=main_kb(), disable_web_page_preview=True); await c.answer()
+    txt, kb = screen_rating(res)
+    await c.message.edit_text(txt, reply_markup=kb, disable_web_page_preview=True); await c.answer()
+
+@dp.callback_query(F.data.startswith("r:"))
+async def cb_rating_page(c: CallbackQuery):
+    try:
+        page = int(c.data[2:])
+    except (TypeError, ValueError):
+        page = 0
+    _, res = await get_data()
+    txt, kb = screen_rating(res, page)
+    await c.message.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
+    await c.answer()
 
 @dp.callback_query(F.data == "express")
 async def cb_express(c: CallbackQuery):
