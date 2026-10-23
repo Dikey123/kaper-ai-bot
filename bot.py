@@ -201,8 +201,8 @@ def bar(cnt):
     def blk(n): return "█" * round(n / tot * 10)
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
-def opinion_block(src, emoji, name):
-    """Единый блок мнения одного ИИ. src = {score, text, conf(0-5), bet}. Пусто → "" ."""
+def opinion_block(src, emoji, name, match=None):
+    """Показывает мнение ИИ и только те выборы, для которых есть коэффициент."""
     if not src:
         return ""
     try:
@@ -211,8 +211,12 @@ def opinion_block(src, emoji, name):
         conf = 0
     dots = "●" * conf + "○" * (5 - conf)
     out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
-    if src.get("bet"):
-        out += f"\nВыбор {name}: <b>{e(src['bet'])}</b>  (уверенность {dots})"
+    bet = str(src.get("bet") or "").strip()
+    if bet and match:
+        price, estimated = _price_for_pick(match, bet)
+        if price:
+            marker = "≈" if estimated else ""
+            out += f"\nВыбор {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (уверенность {dots})"
     return out
 
 def odds_summary(match):
@@ -256,8 +260,8 @@ def screen_match(t, m, res=None):
     if sum(cnt.values()):
         lines.append(f"\n<b>Куда склоняются эксперты</b> ({sum(cnt.values())} прогнозов): " + bar(cnt))
     # Мнения ИИ — два источника (Claude в поле "ai", ChatGPT в поле "gpt")
-    for blk in (opinion_block(m.get("ai"), "🤖", "ИИ"),
-                opinion_block(m.get("gpt"), "🧠", "ChatGPT")):
+    for blk in (opinion_block(m.get("ai"), "🤖", "ИИ", m),
+                opinion_block(m.get("gpt"), "🧠", "ChatGPT", m)):
         if blk:
             lines.append(blk)
     return "\n".join(lines)
@@ -301,9 +305,13 @@ def screen_news(m):
 def screen_tips(m):
     res = f"📊 <b>Прогнозы экспертов</b>\n{m['home']} — {m['away']}\n\n"
     for tp in m.get("tips", []):
+        price = _valid_decimal(tp.get("k"))
+        if not price:
+            continue
         reg = "🇷🇺" if tp.get("reg") == "ru" else "🇪🇺"
-        k = f" — кф {tp['k']}" if tp.get("k") else ""
-        res += f"{reg} <b>{e(tp.get('src',''))}</b>: {e(tp.get('pick',''))}{e(k)}\n"
+        res += f"{reg} <b>{e(tp.get('src',''))}</b>: {e(tp.get('pick',''))} — кф <b>{price:.2f}</b>\n"
+    if res.endswith("\n\n"):
+        return res + "Для остальных прогнозов пока нет коэффициентов."
     return res
 
 # ---------- рейтинг ----------
