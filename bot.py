@@ -1176,7 +1176,8 @@ def _score_for_daily_pick(pick, data, res):
 
 
 def _settle_daily_pick_token(pick, home_goals, away_goals, home, away):
-    text = str(pick or "").strip().lower().replace("ё", "е").replace("х", "x").replace("−", "-").replace("–", "-").replace(",", ".")
+    text = str(pick or "").strip().lower().replace("ё", "е").replace("−", "-").replace("–", "-").replace(",", ".")
+    market_text = text.replace("х", "x")
     total = home_goals + away_goals
     outcome = "1" if home_goals > away_goals else ("2" if home_goals < away_goals else "x")
 
@@ -1201,15 +1202,15 @@ def _settle_daily_pick_token(pick, home_goals, away_goals, home, away):
         adjusted = away_goals + float(handicap.group(1)) - home_goals
         return "push" if adjusted == 0 else ("win" if adjusted > 0 else "lose")
 
-    if re.search(r"(?<![a-zа-я0-9])1\s*x(?![a-zа-я0-9])", text):
+    if re.search(r"(?<![a-zа-я0-9])1\s*x(?![a-zа-я0-9])", market_text):
         return "win" if outcome in ("1", "x") else "lose"
-    if re.search(r"(?<![a-zа-я0-9])x\s*2(?![a-zа-я0-9])", text):
+    if re.search(r"(?<![a-zа-я0-9])x\s*2(?![a-zа-я0-9])", market_text):
         return "win" if outcome in ("x", "2") else "lose"
-    if re.search(r"(?<![a-zа-я0-9])1\s*2(?![a-zа-я0-9])", text):
+    if re.search(r"(?<![a-zа-я0-9])1\s*2(?![a-zа-я0-9])", market_text):
         return "win" if outcome in ("1", "2") else "lose"
 
     exact = re.search(r"(\d+)\s*:\s*(\d+)", text)
-    if exact and ("счет" in text or "точный" in text):
+    if exact and ("счет" in text or "точный" in text or re.fullmatch(r"\s*\d+\s*:\s*\d+\s*", text)):
         return "win" if (int(exact.group(1)) == home_goals and int(exact.group(2)) == away_goals) else "lose"
 
     cleaned = re.sub(r"[^a-zа-я0-9]+", " ", text).strip()
@@ -1256,7 +1257,7 @@ def _signed_rubles(value):
     return _rubles(0)
 
 
-def _settled_pick_report(pick, data, res, label):
+def _settled_pick_report(pick, data, res, label, show_cash=True):
     score = _score_for_daily_pick(pick, data, res)
     if not score:
         return {"line": f"⏳ {label}: счёт ещё не поступил.", "state": None}
@@ -1279,10 +1280,9 @@ def _settled_pick_report(pick, data, res, label):
         net = -1000
         status = "❌ НЕ ЗАШЁЛ"
     price = ("≈" if pick.get("coefficient_estimated") else "") + f"{coefficient:.2f}"
-    line = (
-        f"{status} {label}: {match_name}, выбор <b>{bet}</b>, счёт {e(score)}, кф {e(price)}.\n"
-        f"   Ставка 1 000 ₽ → выплата {_rubles(payout)}, чистый итог {_signed_rubles(net)}."
-    )
+    line = f"{status} {label}: {match_name}, выбор <b>{bet}</b>, счёт {e(score)}, кф {e(price)}."
+    if show_cash:
+        line += f"\n   Ставка 1 000 ₽ → выплата {_rubles(payout)}, чистый итог {_signed_rubles(net)}."
     return {"line": line, "state": result, "payout": payout, "net": net, "coefficient": coefficient}
 
 
@@ -1307,7 +1307,7 @@ def _daily_results_block(history, yesterday, data, res):
 
     express_legs = snapshot.get("express") or []
     if len(express_legs) == 3:
-        reports = [_settled_pick_report(leg, data, res, f"Экспресс {index}/3") for index, leg in enumerate(express_legs, 1)]
+        reports = [_settled_pick_report(leg, data, res, f"Экспресс {index}/3", show_cash=False) for index, leg in enumerate(express_legs, 1)]
         lines.extend(item["line"] for item in reports)
         states = [item.get("state") for item in reports]
         if all(state in ("win", "lose", "push") for state in states):
