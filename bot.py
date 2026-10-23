@@ -109,29 +109,89 @@ def find_match(data, tid, idx):
                 return t, ms[idx]
     return None, None
 
+def date_window(data):
+    today = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=3))).date()
+    return today, [today + datetime.timedelta(days=i) for i in range(-2, 5)]
+
+def score_for_match(match, res):
+    score = match.get("ft") or match.get("score")
+    if not score and res:
+        norm = lambda value: re.sub(r"[^a-zа-я0-9]", "", str(value or "").lower().replace("ё", "е"))
+        for result in (res.get("recent") or []):
+            if (result.get("date") == match.get("date")
+                    and norm(result.get("home")) == norm(match.get("home"))
+                    and norm(result.get("away")) == norm(match.get("away"))):
+                score = result.get("score") or result.get("ft")
+                if score:
+                    break
+    return re.sub(r"\s*[-:]\s*", ":", str(score)).strip() if score else ""
+
+def date_button_label(day, today, count):
+    offset = (day - today).days
+    if offset == -2:
+        label = "2 дня назад"
+    elif offset == -1:
+        label = "Вчера"
+    elif offset == 0:
+        label = "Сегодня"
+    elif offset == 1:
+        label = "Завтра"
+    else:
+        label = f"Через {offset} дн."
+    return f"{label} · {count}"
+
 # ---------- экранчики ----------
 def main_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=BASE))
-    kb.button(text="⚽ Матчи сегодня", callback_data="today")
+    kb.button(text="⚽ Матчи по датам", callback_data="today")
     kb.button(text="🏆 Рейтинг", callback_data="rating")
     kb.button(text="⚡ Экспресс дня", callback_data="express")
     kb.adjust(1, 1, 2)
     return kb.as_markup()
 
-async def screen_today(data):
-    today = data.get("today")
-    rows = [(t, i, m) for (t, i, m) in all_matches(data) if m.get("date") == today]
+async def screen_today(data, res=None, selected=None):
+    today, dates = date_window(data)
+    try:
+        selected_day = datetime.date.fromisoformat(str(selected)) if selected else today
+    except ValueError:
+        selected_day = today
+    if selected_day not in dates:
+        selected_day = today
+    selected_iso = selected_day.isoformat()
+    rows = [(t, i, m) for (t, i, m) in all_matches(data) if m.get("date") == selected_iso]
+    rows.sort(key=lambda row: (str(row[2].get("time") or ""), str(row[2].get("home") or "")))
+    if selected_day == today:
+        title = f"⚽ Матчи сегодня — {e(dlabel(selected_iso))}"
+        hint = "Нажмите на матч, чтобы открыть карточку."
+    elif selected_day < today:
+        title = f"⚽ Результаты — {e(dlabel(selected_iso))}"
+        hint = "Итоговый счёт указан на кнопке матча, если источник уже его прислал."
+    else:
+        title = f"⚽ Матчи — {e(dlabel(selected_iso))}"
+        hint = "Нажмите на матч, чтобы открыть прогноз."
+    txt = f"<b>{title}</b>\n<i>{hint}</i>"
     if not rows:
-        return f"На сегодня ({dlabel(today)}) матчей нет. Нажмите /start и загляните позже.", None
-    txt = f"<b>⚽ Матчи сегодня — {e(dlabel(today))}</b>\n<i>Нажмите на матч, чтобы открыть прогноз.</i>"
+        txt += "\n\nНа эту дату матчей нет. Выберите другой день ниже."
     kb = InlineKeyboardBuilder()
+    counts = {day.isoformat(): 0 for day in dates}
+    for _, _, match in all_matches(data):
+        if match.get("date") in counts:
+            counts[match["date"]] += 1
+    for day in dates:
+        day_iso = day.isoformat()
+        kb.button(text=date_button_label(day, today, counts[day_iso]), callback_data=f"d:{day_iso}")
     for t, i, m in rows:
         full = m.get("status") == "full"
-        label = f"{m['time']}  {m['home']} — {m['away']}" + ("" if full else "  (расписание)")
+        score = score_for_match(m, res)
+        if selected_day < today:
+            label = f"{score}  {m['home']} — {m['away']}" if score else f"{m['home']} — {m['away']} · счёт уточняется"
+        else:
+            label = f"{m.get('time') or 'Время уточняется'}  {m['home']} — {m['away']}" + ("" if full else "  (расписание)")
         kb.button(text=label[:60], callback_data=f"m:{t['id']}:{i}")
     kb.button(text="⬅️ В меню", callback_data="menu")
-    kb.adjust(1)
+    kb.adjust(4, 3, *([1] * (len(rows) + 1)))
     return txt, kb.as_markup()
 
 def bar(cnt):
@@ -155,10 +215,13 @@ def opinion_block(src, emoji, name):
         out += f"\nВыбор {name}: <b>{e(src['bet'])}</b>  (уверенность {dots})"
     return out
 
-def screen_match(t, m):
+def screen_match(t, m, res=None):
     lines = [f"<b>{e(m['home'])} — {e(m['away'])}</b>",
              f"{e(t.get('name',''))} · {e(t.get('round',''))}",
              f"🗓 {e(dlabel(m['date']))}, {e(m['time'])}" + (f" · {e(m.get('venue',''))}" if m.get('venue') else "")]
+    score = score_for_match(m, res)
+    if score:
+        lines.append(f"🏁 Итоговый счёт: <b>{e(score)}</b>")
     o = m.get("odds") or [None, None, None]
     if any(x is not None for x in o):
         def f(x): return "—" if x is None else f"{x:.2f}"
@@ -188,7 +251,7 @@ def match_kb(t, idx, m):
         kb.button(text="📰 Новости матча", callback_data=f"nw:{t['id']}:{idx}")
     if m.get("tips"):
         kb.button(text="📊 Все прогнозы", callback_data=f"tp:{t['id']}:{idx}")
-    kb.button(text="⬅️ К матчам", callback_data="today")
+    kb.button(text="⬅️ К матчам", callback_data=f"d:{m.get('date', '')}")
     kb.adjust(2, 1)
     return kb.as_markup()
 
@@ -407,8 +470,8 @@ dp.callback_query.outer_middleware(SubGate())
 async def start(msg: Message):
     await msg.answer(
         "👋 Привет! Это <b>Капер ИИ</b> — прогнозы на футбол: Лига чемпионов, Лига Европы и топ-5 лиг.\n\n"
-        "• Матчи дня с коэффициентами, составами и новостями\n"
-        "• Мнение ИИ по каждому матчу\n"
+        "• Матчи за 2 дня назад — 4 дня вперёд, с результатами сыгранных\n"
+        "• Коэффициенты, составы, новости и мнение ИИ по матчам\n"
         "• Рейтинг прогнозистов по реальной проходимости\n"
         "• Конструктор экспресса\n\n"
         "<i>18+. Это аналитика, а не гарантия результата.</i>",
@@ -420,12 +483,12 @@ async def cmd_app(msg: Message):
     kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=BASE))
     await msg.answer("Открыть «Капер ИИ» как приложение — на весь экран:", reply_markup=kb.as_markup())
 
-@dp.message(Command("today"))
+@dp.message(Command("today", "matches"))
 async def cmd_today(msg: Message):
-    data, _ = await get_data()
+    data, res = await get_data()
     if not data:
         return await msg.answer("Не удалось загрузить данные. Попробуйте позже.")
-    txt, kb = await screen_today(data)
+    txt, kb = await screen_today(data, res)
     await msg.answer(txt, reply_markup=kb)
 
 @dp.message(Command("rating"))
@@ -444,8 +507,18 @@ async def cb_menu(c: CallbackQuery):
 
 @dp.callback_query(F.data == "today")
 async def cb_today(c: CallbackQuery):
-    data, _ = await get_data()
-    txt, kb = await screen_today(data)
+    data, res = await get_data()
+    if not data:
+        return await c.answer("Не удалось загрузить данные. Попробуйте позже.", show_alert=True)
+    txt, kb = await screen_today(data, res)
+    await c.message.edit_text(txt, reply_markup=kb); await c.answer()
+
+@dp.callback_query(F.data.startswith("d:"))
+async def cb_date(c: CallbackQuery):
+    data, res = await get_data()
+    if not data:
+        return await c.answer("Не удалось загрузить данные. Попробуйте позже.", show_alert=True)
+    txt, kb = await screen_today(data, res, c.data[2:])
     await c.message.edit_text(txt, reply_markup=kb); await c.answer()
 
 @dp.callback_query(F.data == "rating")
@@ -461,17 +534,19 @@ async def cb_express(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("m:"))
 async def cb_match(c: CallbackQuery):
     _, tid, idx = c.data.split(":")
-    data, _ = await get_data()
+    data, res = await get_data()
     t, m = find_match(data, tid, int(idx))
     if not m:
         return await c.answer("Матч не найден", show_alert=True)
     if m.get("status") != "full":
+        score = score_for_match(m, res)
+        result_line = f"\n🏁 Итоговый счёт: <b>{e(score)}</b>" if score else ""
         await c.message.edit_text(
-            f"<b>{e(m['home'])} — {e(m['away'])}</b>\n{e(t.get('name',''))}\n🗓 {e(dlabel(m['date']))}, {e(m['time'])}\n\n"
+            f"<b>{e(m['home'])} — {e(m['away'])}</b>\n{e(t.get('name',''))}\n🗓 {e(dlabel(m['date']))}, {e(m['time'])}{result_line}\n\n"
             "Прогнозы, составы и новости появятся в день матча.",
-            reply_markup=InlineKeyboardBuilder().button(text="⬅️ К матчам", callback_data="today").as_markup())
+            reply_markup=InlineKeyboardBuilder().button(text="⬅️ К матчам", callback_data=f"d:{m.get('date', '')}").as_markup())
         return await c.answer()
-    await c.message.edit_text(screen_match(t, m), reply_markup=match_kb(t, int(idx), m), disable_web_page_preview=True)
+    await c.message.edit_text(screen_match(t, m, res), reply_markup=match_kb(t, int(idx), m), disable_web_page_preview=True)
     await c.answer()
 
 @dp.callback_query(F.data.startswith(("lu:", "nw:", "tp:")))
@@ -634,7 +709,8 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Меню"),
         BotCommand(command="app", description="Открыть приложение"),
-        BotCommand(command="today", description="Матчи сегодня"),
+        BotCommand(command="matches", description="Матчи и результаты по датам"),
+        BotCommand(command="today", description="Матчи и результаты по датам"),
         BotCommand(command="rating", description="Рейтинг прогнозистов"),
         BotCommand(command="express", description="Экспресс дня"),
     ])
