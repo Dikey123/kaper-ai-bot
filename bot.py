@@ -225,21 +225,19 @@ def bar(cnt):
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
 def opinion_block(src, emoji, name, match=None):
-    """Показывает только AI-ставки с оценкой не ниже 75% и коэффициентом."""
+    """Показывает AI-ставку только с оценкой от 75% и доступным коэффициентом."""
     if not src:
         return ""
     if not ai_bet_eligible(src):
-        return f"\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с подтверждённой оценкой от 75%."
+        return f"\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с оценкой модели от 75%."
     probability = ai_probability(src)
-    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
     bet = str(src.get("bet") or src.get("pick") or "").strip()
-    if match:
-        price, estimated = _price_for_pick(match, bet)
-        if price:
-            marker = "≈" if estimated else ""
-            out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
-        else:
-            out += f"\nСтавка {name}: <b>{e(bet)}</b> — оценка модели {probability}%; коэффициент не найден."
+    price, estimated = _price_for_pick(match, bet) if match else (None, False)
+    if not price:
+        return f"\n{emoji} <b>Мнение {name}</b>: котировка для выбранного исхода не найдена, ставка пропущена."
+    marker = "≈" if estimated else ""
+    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
+    out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
     sources = [s for s in (src.get("sources") or []) if isinstance(s, dict) and str(s.get("url") or "").startswith(("https://", "http://"))][:4]
     if sources:
         out += "\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
