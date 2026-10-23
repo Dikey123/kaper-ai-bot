@@ -12,7 +12,7 @@
 Токен НЕ хранится в коде. Передаётся через переменную окружения BOT_TOKEN.
 Запуск локально:   BOT_TOKEN=xxxx python bot.py
 """
-import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime
+import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime, base64
 import aiohttp
 from aiohttp import web
 from urllib.parse import parse_qsl
@@ -26,6 +26,11 @@ from aiogram.client.default import DefaultBotProperties
 # Источник данных — наш публичный сайт
 BASE = os.environ.get("DATA_BASE", "https://dikey123.github.io/football-prognozy/")
 TOKEN = os.environ.get("BOT_TOKEN")
+POST_HISTORY_REPO = os.environ.get("POST_HISTORY_REPO", "Dikey123/football-prognozy").strip()
+POST_HISTORY_FILE = os.environ.get("POST_HISTORY_FILE", "daily_posts.json").strip()
+POST_HISTORY_BRANCH = os.environ.get("POST_HISTORY_BRANCH", "main").strip()
+POST_HISTORY_TOKEN = os.environ.get("POST_HISTORY_TOKEN", "").strip()
+_POST_HISTORY_MEMORY = []
 if not TOKEN:
     raise SystemExit("Не задан BOT_TOKEN (переменная окружения).")
 
@@ -942,6 +947,8 @@ def _daily_model_candidates(data, res, today):
 def _daily_predictions_block(data, res, today):
     candidates = _daily_model_candidates(data, res, today)
     out = []
+    snapshot = {"date": today, "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "single": None, "express": []}
     if candidates:
         best = candidates[0]
         meta = []
@@ -956,6 +963,13 @@ def _daily_predictions_block(data, res, today):
         suffix = " · " + " · ".join(meta) if meta else ""
         title = "Выбор ИИ" if not best["fallback"] else "Осторожный выбор по котировкам для прогноза ИИ"
         price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
+        snapshot["single"] = {
+            "date": today, "home": best["home"], "away": best["away"],
+            "tournament": best["tournament"], "time": best["time"],
+            "bet": best["bet"], "coefficient": best["coefficient"],
+            "coefficient_estimated": best["coefficient_estimated"],
+            "model": best["model"], "probability": best["probability"],
+        }
         out.extend([
             f"🎯 <b>Лучший прогноз дня</b>",
             f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
@@ -975,11 +989,18 @@ def _daily_predictions_block(data, res, today):
         for index, item in enumerate(legs, 1):
             total *= item["odd"]
             price = _format_pick_price(item)
+            snapshot["express"].append({
+                "date": today, "home": item["m"]["home"], "away": item["m"]["away"],
+                "tournament": item["tour"], "time": item["m"].get("time") or "",
+                "bet": item["pick"], "coefficient": item["odd"],
+                "coefficient_estimated": item["estimated"],
+            })
             out.append(
                 f"{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
                 f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\n"
                 f"   {e(item['pick'])} — кф <b>{price}</b>"
             )
+        snapshot["express_coefficient"] = total
         marker = "≈" if any(item.get("estimated") for item in legs) else ""
         out.append(f"<b>Общий коэффициент: {marker}{total:.2f}</b>")
         if any(item.get("estimated") for item in legs):
@@ -988,7 +1009,7 @@ def _daily_predictions_block(data, res, today):
         out.append("\n⚡ <b>Экспресс дня — 3 события</b>")
         out.append("Сегодня пока нет коэффициентов минимум на три предстоящих матча, поэтому непроверенные цены не публикуем.")
     out.append("<i>Экспресс рискованнее одиночного события: должны пройти все три выбора. 18+</i>")
-    return "\n".join(out)
+    return "\n".join(out), snapshot
 
 def _daily_rating_block(res):
     """Показывает текущую проходимость источников и моделей по закрытым прогнозам."""
@@ -1051,6 +1072,267 @@ def _daily_rating_block(res):
     return "\n".join(out)
 
 
+
+_HISTORY_API = f"https://api.github.com/repos/{POST_HISTORY_REPO}/contents/{POST_HISTORY_FILE}"
+
+async def _read_daily_post_history():
+    if not POST_HISTORY_TOKEN:
+        return {"version": 1, "posts": list(_POST_HISTORY_MEMORY)}, None, True
+    headers = {
+        "Authorization": f"Bearer {POST_HISTORY_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(_HISTORY_API, params={"ref": POST_HISTORY_BRANCH}, headers=headers) as response:
+                if response.status == 404:
+                    return {"version": 1, "posts": []}, None, True
+                if response.status != 200:
+                    print("Не удалось прочитать архив ежедневных постов, HTTP", response.status)
+                    return None, None, False
+                remote = await response.json(content_type=None)
+        raw = base64.b64decode(remote.get("content", "")).decode("utf-8")
+        document = json.loads(raw)
+        if not isinstance(document, dict) or not isinstance(document.get("posts"), list):
+            print("Архив ежедневных постов имеет неверный формат.")
+            return None, None, False
+        return document, remote.get("sha"), True
+    except Exception as ex:
+        print("Не удалось прочитать архив ежедневных постов:", ex)
+        return None, None, False
+
+
+async def load_daily_post_history():
+    document, _, ok = await _read_daily_post_history()
+    if ok and document is not None:
+        return document
+    return {"version": 1, "posts": list(_POST_HISTORY_MEMORY)}
+
+
+async def save_daily_post_snapshot(snapshot):
+    posts = [item for item in _POST_HISTORY_MEMORY if item.get("date") != snapshot.get("date")]
+    posts.append(snapshot)
+    _POST_HISTORY_MEMORY[:] = posts[-90:]
+    if not POST_HISTORY_TOKEN:
+        print("POST_HISTORY_TOKEN не задан: архив ежедневных постов пока хранится только в памяти процесса.")
+        return False
+
+    document, sha, ok = await _read_daily_post_history()
+    if not ok or document is None:
+        print("Снимок поста не сохранён: не удалось прочитать архив.")
+        return False
+    remote_posts = [item for item in document.get("posts", []) if item.get("date") != snapshot.get("date")]
+    remote_posts.append(snapshot)
+    document = {"version": 1, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "posts": remote_posts[-90:]}
+    payload = {
+        "message": f"chore: сохранить пост с прогнозами за {snapshot.get('date', '')}",
+        "content": base64.b64encode(json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
+        "branch": POST_HISTORY_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+    headers = {
+        "Authorization": f"Bearer {POST_HISTORY_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.put(_HISTORY_API, json=payload, headers=headers) as response:
+                if response.status not in (200, 201):
+                    print("Не удалось сохранить архив ежедневных постов, HTTP", response.status)
+                    return False
+        print(f"Снимок ежедневного поста сохранён: {snapshot.get('date')}.")
+        return True
+    except Exception as ex:
+        print("Не удалось сохранить архив ежедневных постов:", ex)
+        return False
+
+
+def _history_norm_team(value):
+    return re.sub(r"[^a-zа-я0-9]", "", str(value or "").lower().replace("ё", "е"))
+
+
+def _score_for_daily_pick(pick, data, res):
+    date = str(pick.get("date") or "")
+    home, away = _history_norm_team(pick.get("home")), _history_norm_team(pick.get("away"))
+    for _, _, match in all_matches(data or {}):
+        if (match.get("date") == date
+                and _history_norm_team(match.get("home")) == home
+                and _history_norm_team(match.get("away")) == away):
+            score = score_for_match(match, res)
+            if score:
+                return score
+    for result in (res or {}).get("recent", []) or []:
+        if (result.get("date") == date
+                and _history_norm_team(result.get("home")) == home
+                and _history_norm_team(result.get("away")) == away):
+            score = result.get("score") or result.get("ft")
+            if score:
+                return re.sub(r"\\s*[-:]\\s*", ":", str(score)).strip()
+    return ""
+
+
+def _settle_daily_pick_token(pick, home_goals, away_goals, home, away):
+    text = str(pick or "").strip().lower().replace("ё", "е").replace("х", "x").replace("−", "-").replace("–", "-").replace(",", ".")
+    total = home_goals + away_goals
+    outcome = "1" if home_goals > away_goals else ("2" if home_goals < away_goals else "x")
+
+    if "обе заб" in text or "оба заб" in text or re.search(r"(?<![а-я])оз(?![а-я])", text):
+        yes = not any(word in text for word in ("нет", "не заб", "no"))
+        return "win" if ((home_goals > 0 and away_goals > 0) == yes) else "lose"
+
+    total_line = re.search(r"(?:тотал\\s*(?:больше|меньше)|т[бм]|over|under|больше|меньше)\\s*[:(]?\\s*(\\d+(?:\\.\\d+)?)", text)
+    if total_line:
+        line = float(total_line.group(1))
+        over = any(word in text for word in ("тб", "больше", "over"))
+        if total == line:
+            return "push"
+        return "win" if ((total > line) == over) else "lose"
+
+    handicap = re.search(r"(?:фора\\s*1|ф1)\\s*\\(?\\s*([+-]?\\d+(?:\\.\\d+)?)", text)
+    if handicap:
+        adjusted = home_goals + float(handicap.group(1)) - away_goals
+        return "push" if adjusted == 0 else ("win" if adjusted > 0 else "lose")
+    handicap = re.search(r"(?:фора\\s*2|ф2)\\s*\\(?\\s*([+-]?\\d+(?:\\.\\d+)?)", text)
+    if handicap:
+        adjusted = away_goals + float(handicap.group(1)) - home_goals
+        return "push" if adjusted == 0 else ("win" if adjusted > 0 else "lose")
+
+    if re.search(r"(?<![a-zа-я0-9])1\\s*x(?![a-zа-я0-9])", text):
+        return "win" if outcome in ("1", "x") else "lose"
+    if re.search(r"(?<![a-zа-я0-9])x\\s*2(?![a-zа-я0-9])", text):
+        return "win" if outcome in ("x", "2") else "lose"
+    if re.search(r"(?<![a-zа-я0-9])1\\s*2(?![a-zа-я0-9])", text):
+        return "win" if outcome in ("1", "2") else "lose"
+
+    exact = re.search(r"(\\d+)\\s*:\\s*(\\d+)", text)
+    if exact and ("счет" in text or "точный" in text):
+        return "win" if (int(exact.group(1)) == home_goals and int(exact.group(2)) == away_goals) else "lose"
+
+    cleaned = re.sub(r"[^a-zа-я0-9]+", " ", text).strip()
+    if cleaned in ("п1", "1", "победа 1", "победа хозяев"):
+        return "win" if outcome == "1" else "lose"
+    if cleaned in ("п2", "2", "победа 2", "победа гостей"):
+        return "win" if outcome == "2" else "lose"
+    if cleaned in ("х", "x", "ничья", "ничья x"):
+        return "win" if outcome == "x" else "lose"
+
+    home_norm, away_norm = _history_norm_team(home), _history_norm_team(away)
+    if "не проигр" in text or "не уступ" in text:
+        if home_norm and home_norm in _history_norm_team(text):
+            return "win" if outcome in ("1", "x") else "lose"
+        if away_norm and away_norm in _history_norm_team(text):
+            return "win" if outcome in ("2", "x") else "lose"
+    if "побед" in text or "выигр" in text:
+        if home_norm and home_norm in _history_norm_team(text):
+            return "win" if outcome == "1" else "lose"
+        if away_norm and away_norm in _history_norm_team(text):
+            return "win" if outcome == "2" else "lose"
+    return None
+
+
+def _settle_daily_pick(pick, score):
+    score_match = re.match(r"\\s*(\\d+)\\s*[:\\-]\\s*(\\d+)", str(score or ""))
+    if not score_match:
+        return None
+    return _settle_daily_pick_token(
+        pick.get("bet", ""), int(score_match.group(1)), int(score_match.group(2)),
+        pick.get("home", ""), pick.get("away", ""),
+    )
+
+
+def _rubles(value):
+    return f"{int(round(value)):,}".replace(",", " ") + " ₽"
+
+
+def _signed_rubles(value):
+    if value > 0:
+        return "+" + _rubles(value)
+    if value < 0:
+        return "−" + _rubles(abs(value))
+    return _rubles(0)
+
+
+def _settled_pick_report(pick, data, res, label):
+    score = _score_for_daily_pick(pick, data, res)
+    if not score:
+        return {"line": f"⏳ {label}: счёт ещё не поступил.", "state": None}
+    result = _settle_daily_pick(pick, score)
+    coefficient = _valid_decimal(pick.get("coefficient"))
+    match_name = f"{e(pick.get('home'))} — {e(pick.get('away'))}"
+    bet = e(pick.get("bet") or "")
+    if result is None or not coefficient:
+        return {"line": f"⚠️ {label}: {match_name}, счёт {e(score)}; исход ставки или коэффициент не удалось надёжно рассчитать.", "state": None}
+    if result == "win":
+        payout = round(1000 * coefficient)
+        net = payout - 1000
+        status = "✅ ЗАШЁЛ"
+    elif result == "push":
+        payout = 1000
+        net = 0
+        status = "↩️ ВОЗВРАТ"
+    else:
+        payout = 0
+        net = -1000
+        status = "❌ НЕ ЗАШЁЛ"
+    price = ("≈" if pick.get("coefficient_estimated") else "") + f"{coefficient:.2f}"
+    line = (
+        f"{status} {label}: {match_name}, выбор <b>{bet}</b>, счёт {e(score)}, кф {e(price)}.\n"
+        f"   Ставка 1 000 ₽ → выплата {_rubles(payout)}, чистый итог {_signed_rubles(net)}."
+    )
+    return {"line": line, "state": result, "payout": payout, "net": net, "coefficient": coefficient}
+
+
+def _daily_results_block(history, yesterday, data, res):
+    posts = history.get("posts") if isinstance(history, dict) else []
+    snapshot = next((item for item in (posts or []) if item.get("date") == yesterday), None)
+    title = f"📊 <b>Результаты прогнозов за {e(dlabel(yesterday))}</b>"
+    if not snapshot:
+        return (
+            title + "\nЗа этот день архив опубликованных прогнозов отсутствует. "
+            "С сегодняшнего поста сохраняем ставки и коэффициенты, чтобы считать результат прозрачно."
+        )
+
+    lines = [title]
+    single = snapshot.get("single")
+    if single:
+        report = _settled_pick_report(single, data, res, "Лучший прогноз")
+        lines.append(report["line"])
+    else:
+        report = None
+        lines.append("Вчера основной ИИ-прогноз с доступным коэффициентом не публиковался.")
+
+    express_legs = snapshot.get("express") or []
+    if len(express_legs) == 3:
+        reports = [_settled_pick_report(leg, data, res, f"Экспресс {index}/3") for index, leg in enumerate(express_legs, 1)]
+        lines.extend(item["line"] for item in reports)
+        states = [item.get("state") for item in reports]
+        if all(state in ("win", "lose", "push") for state in states):
+            if "lose" in states:
+                payout, net, result_text = 0, -1000, "❌ ЭКСПРЕСС НЕ ЗАШЁЛ"
+            else:
+                effective_coefficient = 1.0
+                for leg, state in zip(express_legs, states):
+                    if state == "win":
+                        effective_coefficient *= float(leg["coefficient"])
+                payout = round(1000 * effective_coefficient)
+                net = payout - 1000
+                result_text = "✅ ЭКСПРЕСС ЗАШЁЛ"
+            lines.append(
+                f"{result_text}: ставка 1 000 ₽ → выплата {_rubles(payout)}, "
+                f"чистый итог {_signed_rubles(net)}."
+            )
+        else:
+            lines.append("Итог экспресса пока не рассчитан: не по всем трём событиям есть подтверждённый результат.")
+    else:
+        lines.append("Экспресс из трёх событий вчера не публиковался.")
+
+    lines.append("<i>Выплата включает сумму ставки; это расчёт по опубликованным коэффициентам, не обещание дохода. 18+.</i>")
+    return "\n".join(lines)
+
 async def post_daily(bot):
     if not REQUIRED_CHAT:
         return False
@@ -1064,13 +1346,17 @@ async def post_daily(bot):
             datetime.timezone(datetime.timedelta(hours=3))
         ).date().isoformat()
     rows = [m for (t, i, m) in all_matches(data) if m.get("date") == today]
+    predictions_text, snapshot = _daily_predictions_block(data, res, today)
+    history = await load_daily_post_history()
+    yesterday = (datetime.date.fromisoformat(today) - datetime.timedelta(days=1)).isoformat()
+    results_text = _daily_results_block(history, yesterday, data, res)
 
     parts = [
         "🔥 <b>Капер ИИ</b> — прогнозы на сегодня",
         f"⚽ Матчей сегодня: <b>{len(rows)}</b> · {e(dlabel(today))}",
         f"🔄 Данные обновлены: {e(_format_daily_timestamp(data.get('updated')) or 'время не указано')}",
         "",
-        _daily_predictions_block(data, res, today),
+        predictions_text,
         "",
         _daily_rating_block(res),
     ]
@@ -1079,8 +1365,14 @@ async def post_daily(bot):
     parts.append("\nВсе матчи и подробные прогнозы — в приложении 👇\n<i>18+. Аналитика, не гарантия.</i>")
     kb = InlineKeyboardBuilder()
     kb.button(text="⚽ Открыть в боте", url=bot_link())
-    await bot.send_message(REQUIRED_CHAT, "\n".join(parts),
-                           reply_markup=kb.as_markup(), disable_web_page_preview=True)
+    posted = await bot.send_message(REQUIRED_CHAT, "\n".join(parts),
+                                    reply_markup=kb.as_markup(), disable_web_page_preview=True)
+    snapshot["message_id"] = posted.message_id
+    await save_daily_post_snapshot(snapshot)
+    try:
+        await bot.send_message(REQUIRED_CHAT, results_text, disable_web_page_preview=True)
+    except Exception as ex:
+        print("Не удалось отправить отчёт за вчера:", ex)
     print(f"Ежедневный пост отправлен: {today}, матчей {len(rows)}.")
     return True
 
