@@ -47,6 +47,29 @@ DAYS = ["воскресенье","понедельник","вторник","ср
 def e(s):  # экранирование HTML
     return html.escape(str(s if s is not None else ""))
 
+AI_MIN_PROBABILITY = 75
+
+def ai_probability(opinion):
+    if not isinstance(opinion, dict):
+        return None
+    try:
+        if opinion.get("probability") is not None:
+            value = int(opinion["probability"])
+            return value if 0 <= value <= 100 else None
+    except (TypeError, ValueError):
+        pass
+    match = re.search(r"(?<!\\d)(100|[1-9]?\\d)\\s*%", str(opinion.get("text") or ""))
+    return int(match.group(1)) if match else None
+
+def ai_bet_eligible(opinion):
+    return (
+        isinstance(opinion, dict)
+        and opinion.get("eligible") is not False
+        and ai_probability(opinion) is not None
+        and ai_probability(opinion) >= AI_MIN_PROBABILITY
+        and bool(str(opinion.get("bet") or opinion.get("pick") or "").strip())
+    )
+
 def dlabel(s):
     import datetime
     d = datetime.date.fromisoformat(s)
@@ -202,21 +225,24 @@ def bar(cnt):
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
 def opinion_block(src, emoji, name, match=None):
-    """Показывает мнение ИИ и только те выборы, для которых есть коэффициент."""
+    """Показывает только AI-ставки с оценкой не ниже 75% и коэффициентом."""
     if not src:
         return ""
-    try:
-        conf = max(0, min(5, int(src.get("conf", 0) or 0)))
-    except (TypeError, ValueError):
-        conf = 0
-    dots = "●" * conf + "○" * (5 - conf)
-    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
-    bet = str(src.get("bet") or "").strip()
-    if bet and match:
+    if not ai_bet_eligible(src):
+        return f"\\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с подтверждённой оценкой от 75%."
+    probability = ai_probability(src)
+    out = f"\\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\\n{e(src.get('text',''))}"
+    bet = str(src.get("bet") or src.get("pick") or "").strip()
+    if match:
         price, estimated = _price_for_pick(match, bet)
         if price:
             marker = "≈" if estimated else ""
-            out += f"\nВыбор {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (уверенность {dots})"
+            out += f"\\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
+        else:
+            out += f"\\nСтавка {name}: <b>{e(bet)}</b> — оценка модели {probability}%; коэффициент не найден."
+    sources = [s for s in (src.get("sources") or []) if isinstance(s, dict) and str(s.get("url") or "").startswith(("https://", "http://"))][:4]
+    if sources:
+        out += "\\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
     return out
 
 def odds_summary(match):
@@ -323,30 +349,29 @@ def wilson(w, n):
     return (p + z*z/(2*n) - z*((p*(1-p)+z*z/(4*n))/n) ** 0.5) / (1 + z*z/n)
 
 def screen_rating(res):
-    if not res or not res.get("sources"):
+    if not res:
         return "Статистика ещё собирается — рейтинг появится после первых сыгранных матчей."
     rows = []
-    for src, v in res["sources"].items():
-        n = v["win"] + v["lose"]
-        rows.append({"src": src, "reg": v.get("reg","ru"), "win": v["win"], "lose": v["lose"],
-                     "pct": round(v["win"]/n*100) if n else 0, "w": wilson(v["win"], n), "n": n})
-    ai = res.get("ai", {"win":0,"lose":0})
-    an = ai["win"] + ai["lose"]
-    rows.append({"src": "🤖 Мнение ИИ", "reg": "ai", "win": ai["win"], "lose": ai["lose"],
-                 "pct": round(ai["win"]/an*100) if an else 0, "w": wilson(ai["win"], an), "n": an, "ai": True})
-    gpt = res.get("gpt")
-    if gpt:
-        gn = gpt["win"] + gpt["lose"]
-        rows.append({"src": "🧠 ChatGPT", "reg": "ai", "win": gpt["win"], "lose": gpt["lose"],
-                     "pct": round(gpt["win"]/gn*100) if gn else 0, "w": wilson(gpt["win"], gn), "n": gn, "ai": True})
+    for src, v in (res.get("sources") or {}).items():
+        n = int(v.get("win", 0) or 0) + int(v.get("lose", 0) or 0)
+        rows.append({"src": src, "reg": v.get("reg","ru"), "win": int(v.get("win",0) or 0),
+                     "lose": int(v.get("lose",0) or 0),
+                     "pct": round(int(v.get("win",0) or 0)/n*100) if n else 0,
+                     "w": wilson(int(v.get("win",0) or 0), n), "n": n})
+    for key, label in (("gpt75", "🧠 ChatGPT ≥75%"), ("ai75", "🤖 Claude ≥75%")):
+        value = res.get(key) or {"win":0,"lose":0,"push":0}
+        wins, losses = int(value.get("win",0) or 0), int(value.get("lose",0) or 0)
+        n = wins + losses
+        rows.append({"src": label, "reg": "ai", "win": wins, "lose": losses,
+                     "pct": round(wins/n*100) if n else 0, "w": wilson(wins,n), "n": n, "ai": True})
     rows.sort(key=lambda r: (-r["w"], -r["n"], -r["pct"]))
-    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% проходимости по {res.get('matches',0)} сыгранным матчам</i>\n"]
+    out = [f"🏆 <b>Рейтинг прогнозистов</b>\\n<i>% по {res.get('matches',0)} сыгранным матчам; ИИ считается отдельно только для новых ставок от 75%</i>\\n"]
     for i, r in enumerate(rows[:25], 1):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
         out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{r['pct']}%</b> ({r['win']}–{r['lose']}{small})")
-    out.append("\n<i>Комбо и экзотика не учитываются. Это аналитика, не гарантия. 18+</i>")
-    return "\n".join(out)
+    out.append("\\n<i>Прошлые результаты не гарантируют будущие. 18+</i>")
+    return "\\n".join(out)
 
 # ---------- экспресс ----------
 def mkt(pick):
@@ -819,49 +844,35 @@ def _format_daily_timestamp(value):
 
 
 def _daily_model_candidates(data, res, today):
-    """Подбирает актуальные прогнозы ИИ с коэффициентом на тот же рынок."""
+    """Берёт только AI-ставки с вероятностью от 75% и котировкой этого рынка."""
     candidates = []
     for tournament, _, match in all_matches(data):
         if not _upcoming_today(match, today, res):
             continue
         opinions = []
-        for key, label in (("ai", "ИИ"), ("gpt", "ChatGPT")):
+        for key, label in (("ai", "Claude"), ("gpt", "ChatGPT")):
             opinion = match.get(key)
-            if not isinstance(opinion, dict):
+            if not ai_bet_eligible(opinion):
                 continue
+            probability = ai_probability(opinion)
             bet = str(opinion.get("bet") or opinion.get("pick") or "").strip()
-            if not bet:
+            price, estimated = _price_for_pick(match, bet)
+            if not price:
                 continue
-            try:
-                confidence = max(0, min(5, int(opinion.get("conf", 0) or 0)))
-            except (TypeError, ValueError):
-                confidence = 0
             opinions.append({
                 "model": label,
                 "bet": bet,
                 "score": str(opinion.get("score") or "").strip(),
                 "text": str(opinion.get("text") or ""),
-                "confidence": confidence,
+                "probability": probability,
+                "confidence": probability,
+                "price": price,
+                "estimated": estimated,
+                "match": match,
             })
         if not opinions:
             continue
-
-        opinion = max(opinions, key=lambda item: (item["confidence"], item["model"] == "ИИ"))
-        selected_bet = opinion["bet"]
-        price, estimated = _price_for_pick(match, selected_bet)
-        fallback = False
-        if not price:
-            safe_pick, safe_price, safe_estimated = _safe_double_chance(match)
-            if not safe_price:
-                continue
-            selected_bet, price, estimated = safe_pick, safe_price, safe_estimated
-            fallback = True
-
-        probability = re.search(r"\b(100|[1-9]?\d)\s*%", opinion["text"])
-        try:
-            probability_value = float(probability.group(1)) / 100 if probability else 0
-        except (TypeError, ValueError):
-            probability_value = 0
+        opinion = max(opinions, key=lambda item: (item["probability"], item["model"] == "Claude"))
         candidates.append({
             "home": match.get("home", ""),
             "away": match.get("away", ""),
@@ -869,20 +880,19 @@ def _daily_model_candidates(data, res, today):
             "tournament": tournament.get("name", ""),
             "short_tournament": tournament.get("short") or tournament.get("name", ""),
             "experts": len(match.get("tips") or []),
-            "probability": probability.group(1) if probability else "",
-            "probability_value": probability_value,
+            "probability": str(opinion["probability"]),
+            "probability_value": opinion["probability"] / 100,
             "confidence": opinion["confidence"],
             "model": opinion["model"],
             "score": opinion["score"],
             "text": opinion["text"],
-            "bet": selected_bet,
-            "coefficient": price,
-            "coefficient_estimated": estimated,
-            "fallback": fallback,
+            "bet": opinion["bet"],
+            "coefficient": opinion["price"],
+            "coefficient_estimated": opinion["estimated"],
+            "fallback": False,
             "match": match,
         })
     candidates.sort(key=lambda item: (
-        -item["confidence"],
         -item["probability_value"],
         -(1 / item["coefficient"]),
         -item["experts"],
