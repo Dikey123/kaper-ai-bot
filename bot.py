@@ -394,7 +394,9 @@ def screen_rating(res, page=0):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
         push = f" · пуш {r['push']}" if r["push"] else ""
-        out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{r['pct']}%</b> ({r['win']}–{r['lose']}{push}{small})")
+        pct = f"{r['pct']}%" if r["n"] else "—"
+        sample = f"{r['n']} ставок" if r["n"] else "нет рассчитанных ставок"
+        out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{pct}</b> ({r['win']}–{r['lose']} · {sample}{push}{small})")
     out.append("\n<i>Пуши не входят в процент; прошлые результаты не гарантируют будущие. 18+</i>")
     return "\n".join(out), rating_kb(page, total_pages)
 
@@ -991,64 +993,77 @@ def _daily_predictions_block(data, res, today):
     return "\n".join(out)
 
 def _daily_rating_block(res):
-    """Показывает текущую проходимость источников и моделей по закрытым прогнозам."""
+    """Показывает полный рейтинг источников и отдельную статистику ИИ."""
     if not res:
-        return "🏆 <b>Рейтинг прогнозистов</b>\nСтатистика пока недоступна."
+        return "🏆 <b>Рейтинг прогнозистов</b>\\nСтатистика пока недоступна."
 
     sources = []
     for name, value in (res.get("sources") or {}).items():
         try:
             wins = int(value.get("win", 0) or 0)
             losses = int(value.get("lose", 0) or 0)
+            pushes = int(value.get("push", 0) or 0)
         except (TypeError, ValueError):
             continue
         total = wins + losses
-        if total:
-            sources.append({
-                "name": name,
-                "wins": wins,
-                "losses": losses,
-                "total": total,
-                "pct": round(wins / total * 100),
-                "wilson": wilson(wins, total),
-            })
+        sources.append({
+            "name": name,
+            "wins": wins,
+            "losses": losses,
+            "pushes": pushes,
+            "total": total,
+            "pct": round(wins / total * 100) if total else None,
+            "wilson": wilson(wins, total),
+        })
 
-    sources.sort(key=lambda row: (-row["wilson"], -row["total"], -row["pct"]))
-    qualified = [row for row in sources if row["total"] >= 3]
-    shown = (qualified or sources)[:3]
-
+    sources.sort(key=lambda row: (-row["wilson"], -row["total"], -(row["pct"] or 0)))
     out = ["🏆 <b>Рейтинг прогнозистов</b>"]
     done = res.get("done")
     if isinstance(done, list):
-        out.append(f"<i>По {len(done)} матчам с зафиксированным результатом</i>")
+        out.append(
+            f"<i>По {len(done)} матчам с результатом · источников: {len(sources)}</i>"
+        )
 
-    if shown:
-        for index, row in enumerate(shown, 1):
-            note = " · мало данных" if row["total"] < 3 else ""
-            out.append(
-                f"{index}. <b>{e(row['name'])}</b> — {row['pct']}% "
-                f"({row['wins']}–{row['losses']}){note}"
-            )
+    if sources:
+        for index, row in enumerate(sources, 1):
+            if row["total"]:
+                details = f"({row['wins']}–{row['losses']}, {row['total']} ставок"
+                if row["pushes"]:
+                    details += f", возвратов {row['pushes']}"
+                details += ")"
+                pct = f"{row['pct']}%"
+                note = " · мало данных" if row["total"] < 3 else ""
+            else:
+                details = "(нет рассчитанных ставок)"
+                pct = "—"
+                note = ""
+            out.append(f"{index}. <b>{e(row['name'])}</b> — {pct} {details}{note}")
     else:
-        out.append("Рейтинг сайтов появится после первых рассчитанных прогнозов.")
+        out.append("Прогнозов с рассчитанным исходом пока нет.")
 
-    for key, label in (("ai", "ИИ-модель"), ("gpt", "ChatGPT")):
+    for key, label in (("ai", "ИИ-модель ≥75%"), ("gpt", "ChatGPT ≥75%")):
         value = res.get(key) or {}
         try:
             wins = int(value.get("win", 0) or 0)
             losses = int(value.get("lose", 0) or 0)
+            pushes = int(value.get("push", 0) or 0)
         except (TypeError, ValueError):
-            wins = losses = 0
+            wins = losses = pushes = 0
         total = wins + losses
         if total:
+            pct = round(wins / total * 100)
+            out.append(
+                f"{'🤖' if key == 'ai' else '🧠'} <b>{label}</b> — {pct}% "
+                f"({wins}–{losses}, {total} ставок"
+                + (f", возвратов {pushes}" if pushes else "")
+                + (") · мало данных" if total < 3 else ")")
+            )
+        else:
             out.append(
                 f"{'🤖' if key == 'ai' else '🧠'} <b>{label}</b> — "
-                f"{round(wins / total * 100)}% ({wins}–{losses})"
-                + (" · мало данных" if total < 3 else "")
+                "нет ставок от 75% с рассчитанным исходом."
             )
-        elif key == "ai":
-            out.append("🤖 <b>ИИ-модель</b> — статистика накапливается.")
-    return "\n".join(out)
+    return "\\n".join(out)
 
 
 async def post_daily(bot):
