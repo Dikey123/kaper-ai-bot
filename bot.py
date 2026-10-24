@@ -379,7 +379,7 @@ def screen_rating(res, page=0):
                      "lose": losses, "push": pushes,
                      "pct": round(wins/n*100) if n else 0,
                      "w": wilson(wins,n), "n": n})
-    for key, label in (("gpt75", "🧠 ChatGPT ≥75%"), ("ai75", "🤖 Claude ≥75%")):
+    for key, label in (("gpt", "🧠 ChatGPT"), ("gpt75", "🧠 ChatGPT ≥75%"), ("ai", "🤖 ИИ-модель"), ("ai75", "🤖 ИИ ≥75%")):
         value = res.get(key) or {"win":0,"lose":0,"push":0}
         wins = int(value.get("win",0) or 0)
         losses = int(value.get("lose",0) or 0)
@@ -397,7 +397,7 @@ def screen_rating(res, page=0):
         page = 0
     first = page * page_size
     last = min(first + page_size, len(rows))
-    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всего строк: {len(rows)} · страница {page+1}/{total_pages}. ИИ отдельно: только новые ставки от 75%</i>\n"]
+    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всего строк: {len(rows)} · страница {page+1}/{total_pages}. ИИ: все прогнозы и подвыборки ≥75% считаются отдельно</i>\n"]
     for i, r in enumerate(rows[first:last], first + 1):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
