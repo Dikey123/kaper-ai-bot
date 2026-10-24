@@ -995,7 +995,7 @@ def _daily_predictions_block(data, res, today):
 def _daily_rating_block(res):
     """Показывает полный рейтинг источников и отдельную статистику ИИ."""
     if not res:
-        return "🏆 <b>Рейтинг прогнозистов</b>\\nСтатистика пока недоступна."
+        return "🏆 <b>Рейтинг прогнозистов</b>\nСтатистика пока недоступна."
 
     sources = []
     for name, value in (res.get("sources") or {}).items():
@@ -1063,7 +1063,7 @@ def _daily_rating_block(res):
                 f"{'🤖' if key == 'ai' else '🧠'} <b>{label}</b> — "
                 "нет ставок от 75% с рассчитанным исходом."
             )
-    return "\\n".join(out)
+    return "\n".join(out)
 
 
 async def post_daily(bot):
