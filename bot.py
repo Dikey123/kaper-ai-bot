@@ -1041,7 +1041,7 @@ def _daily_rating_block(res):
     else:
         out.append("Прогнозов с рассчитанным исходом пока нет.")
 
-    for key, label in (("ai", "ИИ-модель ≥75%"), ("gpt", "ChatGPT ≥75%")):
+    for key, label in (("ai75", "Claude ≥75%"), ("gpt75", "ChatGPT ≥75%")):
         value = res.get(key) or {}
         try:
             wins = int(value.get("win", 0) or 0)
@@ -1053,14 +1053,14 @@ def _daily_rating_block(res):
         if total:
             pct = round(wins / total * 100)
             out.append(
-                f"{'🤖' if key == 'ai' else '🧠'} <b>{label}</b> — {pct}% "
+                f"{'🤖' if key == 'ai75' else '🧠'} <b>{label}</b> — {pct}% "
                 f"({wins}–{losses}, {total} ставок"
                 + (f", возвратов {pushes}" if pushes else "")
                 + (") · мало данных" if total < 3 else ")")
             )
         else:
             out.append(
-                f"{'🤖' if key == 'ai' else '🧠'} <b>{label}</b> — "
+                f"{'🤖' if key == 'ai75' else '🧠'} <b>{label}</b> — "
                 "нет ставок от 75% с рассчитанным исходом."
             )
     return "\n".join(out)
