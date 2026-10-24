@@ -52,8 +52,6 @@ DAYS = ["воскресенье","понедельник","вторник","ср
 def e(s):  # экранирование HTML
     return html.escape(str(s if s is not None else ""))
 
-AI_MIN_PROBABILITY = 75
-
 def ai_probability(opinion):
     if not isinstance(opinion, dict):
         return None
@@ -65,15 +63,6 @@ def ai_probability(opinion):
         pass
     match = re.search(r"(?<!\d)(100|[1-9]?\d)\s*%", str(opinion.get("text") or ""))
     return int(match.group(1)) if match else None
-
-def ai_bet_eligible(opinion):
-    return (
-        isinstance(opinion, dict)
-        and opinion.get("eligible") is True
-        and ai_probability(opinion) is not None
-        and ai_probability(opinion) >= AI_MIN_PROBABILITY
-        and bool(str(opinion.get("bet") or opinion.get("pick") or "").strip())
-    )
 
 def dlabel(s):
     import datetime
@@ -230,19 +219,33 @@ def bar(cnt):
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
 def opinion_block(src, emoji, name, match=None):
-    """Показывает AI-ставку только с оценкой от 75% и доступным коэффициентом."""
-    if not src:
+    """Всегда показывает мнение модели; коэффициент — только если его удалось подтвердить."""
+    if not isinstance(src, dict):
         return ""
-    if not ai_bet_eligible(src):
-        return f"\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с оценкой модели от 75%."
+    score = str(src.get("score") or "").strip() or "Счёт не указан"
+    text = str(src.get("text") or "").strip() or "Модель не добавила текстовое обоснование."
+    bet = str(src.get("pick") or src.get("bet") or "").strip()
     probability = ai_probability(src)
-    bet = str(src.get("bet") or src.get("pick") or "").strip()
-    price, estimated = _price_for_pick(match, bet) if match else (None, False)
-    if not price:
-        return f"\n{emoji} <b>Мнение {name}</b>: котировка для выбранного исхода не найдена, ставка пропущена."
-    marker = "≈" if estimated else ""
-    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
-    out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
+    if probability is not None:
+        confidence = f"оценка модели {probability}%"
+    else:
+        try:
+            raw_conf = float(src.get("conf"))
+            confidence = f"уверенность {raw_conf:g}/5" if 0 <= raw_conf <= 5 else "оценка уверенности не указана"
+        except (TypeError, ValueError):
+            confidence = "оценка уверенности не указана"
+
+    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(score)}</b>\n{e(text)}"
+    if bet:
+        price, estimated = _price_for_pick(match, bet) if match else (None, False)
+        if price:
+            marker = "≈" if estimated else ""
+            out += f"\nВыбор модели: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> · {e(confidence)}"
+        else:
+            out += f"\nВыбор модели: <b>{e(bet)}</b> · котировка не найдена · {e(confidence)}"
+    else:
+        out += f"\nМодель не выбрала рынок · {e(confidence)}"
+
     sources = [s for s in (src.get("sources") or []) if isinstance(s, dict) and str(s.get("url") or "").startswith(("https://", "http://"))][:4]
     if sources:
         out += "\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
@@ -887,7 +890,7 @@ def _format_daily_timestamp(value):
 
 
 def _daily_model_candidates(data, res, today):
-    """Берёт только AI-ставки с вероятностью от 75% и котировкой этого рынка."""
+    """Берёт мнения моделей без порога 75%; котировка влияет только на пометку ставки."""
     candidates = []
     for tournament, _, match in all_matches(data):
         if not _upcoming_today(match, today, res):
@@ -895,27 +898,41 @@ def _daily_model_candidates(data, res, today):
         opinions = []
         for key, label in (("ai", "Claude"), ("gpt", "ChatGPT")):
             opinion = match.get(key)
-            if not ai_bet_eligible(opinion):
+            if not isinstance(opinion, dict):
+                continue
+            bet = str(opinion.get("pick") or opinion.get("bet") or "").strip()
+            score = str(opinion.get("score") or "").strip() or "Счёт не указан"
+            text = str(opinion.get("text") or "").strip() or "Модель не добавила текстовое обоснование."
+            if not (bet or score != "Счёт не указан" or text != "Модель не добавила текстовое обоснование."):
                 continue
             probability = ai_probability(opinion)
-            bet = str(opinion.get("bet") or opinion.get("pick") or "").strip()
-            price, estimated = _price_for_pick(match, bet)
-            if not price:
-                continue
+            try:
+                raw_conf = float(opinion.get("conf"))
+                valid_conf = 0 <= raw_conf <= 5
+            except (TypeError, ValueError):
+                raw_conf, valid_conf = 0, False
+            confidence_value = probability / 100 if probability is not None else (raw_conf / 5 if valid_conf else 0)
+            confidence_label = (
+                f"оценка модели {probability}%" if probability is not None else
+                f"уверенность {raw_conf:g}/5" if valid_conf else
+                "оценка уверенности не указана"
+            )
+            price, estimated = _price_for_pick(match, bet) if bet else (None, False)
             opinions.append({
                 "model": label,
                 "bet": bet,
-                "score": str(opinion.get("score") or "").strip(),
-                "text": str(opinion.get("text") or ""),
+                "score": score,
+                "text": text,
                 "probability": probability,
-                "confidence": probability,
+                "confidence_value": confidence_value,
+                "confidence_label": confidence_label,
                 "price": price,
                 "estimated": estimated,
                 "match": match,
             })
         if not opinions:
             continue
-        opinion = max(opinions, key=lambda item: (item["probability"], item["model"] == "Claude"))
+        opinion = max(opinions, key=lambda item: (item["price"] is not None, item["confidence_value"], item["model"] == "Claude"))
         candidates.append({
             "home": match.get("home", ""),
             "away": match.get("away", ""),
@@ -923,9 +940,10 @@ def _daily_model_candidates(data, res, today):
             "tournament": tournament.get("name", ""),
             "short_tournament": tournament.get("short") or tournament.get("name", ""),
             "experts": len(match.get("tips") or []),
-            "probability": str(opinion["probability"]),
-            "probability_value": opinion["probability"] / 100,
-            "confidence": opinion["confidence"],
+            "probability": str(opinion["probability"]) if opinion["probability"] is not None else "",
+            "probability_value": opinion["confidence_value"],
+            "confidence": opinion["confidence_value"],
+            "confidence_label": opinion["confidence_label"],
             "model": opinion["model"],
             "score": opinion["score"],
             "text": opinion["text"],
@@ -936,8 +954,8 @@ def _daily_model_candidates(data, res, today):
             "match": match,
         })
     candidates.sort(key=lambda item: (
+        item["coefficient"] is None,
         -item["probability_value"],
-        -(1 / item["coefficient"]),
         -item["experts"],
         item["time"] or "99:99",
     ))
@@ -951,34 +969,39 @@ def _daily_predictions_block(data, res, today):
                 "single": None, "express": []}
     if candidates:
         best = candidates[0]
-        meta = []
-        if best["score"]:
-            meta.append(f"счёт ИИ {e(best['score'])}")
-        if best["probability"]:
-            meta.append(f"оценка модели {best['probability']}%")
-        elif best["confidence"]:
-            meta.append(f"уверенность {best['confidence']}/5")
+        meta = [f"счёт ИИ {e(best['score'])}"]
+        if best["confidence_label"]:
+            meta.append(e(best["confidence_label"]))
         if best["time"]:
             meta.append(e(best["time"]))
         suffix = " · " + " · ".join(meta) if meta else ""
-        title = "Выбор ИИ" if not best["fallback"] else "Осторожный выбор по котировкам для прогноза ИИ"
-        price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
-        snapshot["single"] = {
-            "date": today, "home": best["home"], "away": best["away"],
-            "tournament": best["tournament"], "time": best["time"],
-            "bet": best["bet"], "coefficient": best["coefficient"],
-            "coefficient_estimated": best["coefficient_estimated"],
-            "model": best["model"], "probability": best["probability"],
-        }
-        out.extend([
-            f"🎯 <b>Лучший прогноз дня</b>",
-            f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
-            f"{title}: <b>{e(best['bet'])}</b> — кф <b>{price}</b>{suffix}",
-        ])
+        bet = best["bet"] or "рынок не выбран"
+        if best["coefficient"] and best["bet"]:
+            price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
+            snapshot["single"] = {
+                "date": today, "home": best["home"], "away": best["away"],
+                "tournament": best["tournament"], "time": best["time"],
+                "bet": best["bet"], "coefficient": best["coefficient"],
+                "coefficient_estimated": best["coefficient_estimated"],
+                "model": best["model"], "probability": best["probability"],
+            }
+            out.extend([
+                "🎯 <b>Лучший прогноз дня</b>",
+                f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
+                f"Выбор {e(best['model'])}: <b>{e(bet)}</b> — кф <b>{price}</b>{suffix}",
+                f"Мнение модели: {e(best['text'])}",
+            ])
+        else:
+            out.extend([
+                "🎯 <b>Прогноз ИИ дня</b>",
+                f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
+                f"Выбор {e(best['model'])}: <b>{e(bet)}</b> · котировка не найдена{suffix}",
+                f"Мнение модели: {e(best['text'])}",
+            ])
     else:
         out.extend([
-            "🎯 <b>Прогноз дня</b>",
-            "Пока нет прогноза на предстоящий матч с проверяемым коэффициентом.",
+            "🎯 <b>Прогноз ИИ дня</b>",
+            "Мнение по сегодняшним матчам ещё не поступило — блок заполнится, когда генератор подготовит прогнозы.",
         ])
 
     today_value = data.get("today") or today
@@ -1010,6 +1033,7 @@ def _daily_predictions_block(data, res, today):
         out.append("Сегодня пока нет коэффициентов минимум на три предстоящих матча, поэтому непроверенные цены не публикуем.")
     out.append("<i>Экспресс рискованнее одиночного события: должны пройти все три выбора. 18+</i>")
     return "\n".join(out), snapshot
+
 
 def _daily_rating_block(res):
     """Показывает текущую проходимость источников и моделей по закрытым прогнозам."""
