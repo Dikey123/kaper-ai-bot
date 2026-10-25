@@ -225,11 +225,11 @@ def bar(cnt):
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
 def opinion_block(src, emoji, name, match=None):
-    """Показывает AI-ставку только с оценкой от 75% и доступным коэффициентом."""
+    """Показывает опубликованную ставку ИИ при допустимой оценке и коэффициенте."""
     if not src:
         return ""
     if not ai_bet_eligible(src):
-        return f"\n{emoji} <b>Мнение {name}</b>: нет ставки ИИ с оценкой модели от 75%."
+        return f"\n{emoji} <b>Мнение {name}</b>: нет опубликованной ставки с подходящим коэффициентом."
     probability = ai_probability(src)
     bet = str(src.get("bet") or src.get("pick") or "").strip()
     price, estimated = _price_for_pick(match, bet) if match else (None, False)
@@ -914,7 +914,7 @@ def _format_daily_timestamp(value):
 
 
 def _daily_model_candidates(data, res, today):
-    """Берёт только AI-ставки с вероятностью от 75% и котировкой этого рынка."""
+    """Берёт AI-ставки с текущим внутренним порогом и котировкой выбранного рынка."""
     candidates = []
     for tournament, _, match in all_matches(data):
         if not _upcoming_today(match, today, res):
