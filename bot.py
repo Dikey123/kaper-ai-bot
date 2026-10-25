@@ -1023,7 +1023,7 @@ def _daily_predictions_block(data, res, today, express_legs=None):
 
 
 def _daily_rating_block(res):
-    """Полный рейтинг источников; текущая и историческая статистика ИИ разделены."""
+    """Ежедневный пост показывает топ-25 источников; статистика ИИ идёт отдельно."""
     if not res:
         return "🏆 <b>Рейтинг прогнозистов</b>\nСтатистика пока недоступна."
 
@@ -1047,10 +1047,15 @@ def _daily_rating_block(res):
         })
 
     sources.sort(key=lambda row: (-row["wilson"], -row["total"], -(row["pct"] or 0)))
-    out = ["🏆 <b>Рейтинг прогнозистов</b>"]
+    ranked_sources = [row for row in sources if row["total"] > 0]
+    total_ranked = len(ranked_sources)
+    sources = ranked_sources[:25]
+    out = ["🏆 <b>Топ-25 прогнозистов</b>"]
     done = res.get("done")
     if isinstance(done, list):
-        out.append(f"<i>По {len(done)} матчам с результатом · источников: {len(sources)}</i>")
+        out.append(
+            f"<i>По {len(done)} матчам с результатом · показано {len(sources)} из {total_ranked}</i>"
+        )
 
     if sources:
         for index, row in enumerate(sources, 1):
