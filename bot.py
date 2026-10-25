@@ -236,7 +236,7 @@ def opinion_block(src, emoji, name, match=None):
         return f"\n{emoji} <b>Мнение {name}</b>: котировка для выбранного исхода не найдена, ставка пропущена."
     marker = "≈" if estimated else ""
     opinion_text = re.sub(
-        r"\\s*Оценка модели\\s*[—:-]?\\s*\\d+\\s*%\\s*;?\\s*это прогноз, не факт\\.?",
+        r"\s*Оценка модели\s*[—:-]?\s*\d+\s*%\s*;?\s*это прогноз, не факт\.?",
         "", str(src.get("text") or ""), flags=re.I,
     ).strip()
     out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(opinion_text)}"
