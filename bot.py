@@ -230,14 +230,17 @@ def opinion_block(src, emoji, name, match=None):
         return ""
     if not ai_bet_eligible(src):
         return f"\n{emoji} <b>Мнение {name}</b>: нет опубликованной ставки с подходящим коэффициентом."
-    probability = ai_probability(src)
     bet = str(src.get("bet") or src.get("pick") or "").strip()
     price, estimated = _price_for_pick(match, bet) if match else (None, False)
     if not price:
         return f"\n{emoji} <b>Мнение {name}</b>: котировка для выбранного исхода не найдена, ставка пропущена."
     marker = "≈" if estimated else ""
-    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(src.get('text',''))}"
-    out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b> (оценка модели {probability}%)"
+    opinion_text = re.sub(
+        r"\\s*Оценка модели\\s*[—:-]?\\s*\\d+\\s*%\\s*;?\\s*это прогноз, не факт\\.?",
+        "", str(src.get("text") or ""), flags=re.I,
+    ).strip()
+    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(opinion_text)}"
+    out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b>"
     sources = [s for s in (src.get("sources") or []) if isinstance(s, dict) and str(s.get("url") or "").startswith(("https://", "http://"))][:4]
     if sources:
         out += "\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
