@@ -979,10 +979,6 @@ def _daily_predictions_block(data, res, today, express_legs=None):
         meta = []
         if best["score"]:
             meta.append(f"счёт ИИ {e(best['score'])}")
-        if best["probability"]:
-            meta.append(f"оценка модели {best['probability']}%")
-        if best["confidence"]:
-            meta.append(f"уверенность {best['confidence']}/5")
         if best["time"]:
             meta.append(e(best["time"]))
         suffix = " · " + " · ".join(meta) if meta else ""
