@@ -7,12 +7,12 @@
   /today   — матчи на сегодня (все турниры)
   /match   — карточка матча (через кнопки): коэффициенты, составы, новости, мнение ИИ
   /rating  — рейтинг прогнозистов (% проходимости) + строка ИИ
-  /express — экспресс дня (3–4 самых вероятных события разных рынков)
+  /express — экспресс дня (3–5 событий, общий коэффициент от 2.00)
 
 Токен НЕ хранится в коде. Передаётся через переменную окружения BOT_TOKEN.
 Запуск локально:   BOT_TOKEN=xxxx python bot.py
 """
-import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime
+import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime, itertools
 import aiohttp
 from aiohttp import web
 from urllib.parse import parse_qsl
@@ -47,7 +47,7 @@ DAYS = ["воскресенье","понедельник","вторник","ср
 def e(s):  # экранирование HTML
     return html.escape(str(s if s is not None else ""))
 
-AI_MIN_PROBABILITY = 75
+AI_MIN_PROBABILITY = 60
 
 def ai_probability(opinion):
     if not isinstance(opinion, dict):
@@ -371,7 +371,12 @@ def screen_rating(res, page=0):
                      "lose": losses, "push": pushes,
                      "pct": round(wins/n*100) if n else 0,
                      "w": wilson(wins,n), "n": n})
-    for key, label in (("gpt75", "🧠 ChatGPT ≥75%"), ("ai75", "🤖 Claude ≥75%")):
+    for key, label in (
+        ("gpt60", "🧠 Локальная модель · текущая выборка"),
+        ("ai60", "🤖 Claude · текущая выборка"),
+        ("gpt75", "🧠 Локальная модель · архив ≥75%"),
+        ("ai75", "🤖 Claude · архив ≥75%"),
+    ):
         value = res.get(key) or {"win":0,"lose":0,"push":0}
         wins = int(value.get("win",0) or 0)
         losses = int(value.get("lose",0) or 0)
@@ -389,16 +394,17 @@ def screen_rating(res, page=0):
         page = 0
     first = page * page_size
     last = min(first + page_size, len(rows))
-    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всего строк: {len(rows)} · страница {page+1}/{total_pages}. ИИ отдельно: только новые ставки от 75%</i>\n"]
+    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всех строк: {len(rows)} · страница {page+1}/{total_pages}. Текущую статистику ИИ и архив ≥75% показываем отдельно.</i>\n"]
     for i, r in enumerate(rows[first:last], first + 1):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
-        push = f" · пуш {r['push']}" if r["push"] else ""
+        push = f" · возвратов {r['push']}" if r["push"] else ""
         pct = f"{r['pct']}%" if r["n"] else "—"
         sample = f"{r['n']} ставок" if r["n"] else "нет рассчитанных ставок"
         out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{pct}</b> ({r['win']}–{r['lose']} · {sample}{push}{small})")
-    out.append("\n<i>Пуши не входят в процент; прошлые результаты не гарантируют будущие. 18+</i>")
+    out.append("\n<i>Возвраты не входят в процент; прошлые результаты не гарантируют будущие. 18+</i>")
     return "\n".join(out), rating_kb(page, total_pages)
+
 
 # ---------- экспресс ----------
 def mkt(pick):
@@ -555,6 +561,7 @@ def _upcoming_today(match, today, res=None):
 
 
 def express(data, n=3, res=None, today=None):
+    """Подбирает 3–5 наиболее вероятных разных матчей с общим кф не ниже 2.00."""
     if not data:
         return []
     today = today or data.get("today") or datetime.datetime.now(
@@ -567,10 +574,6 @@ def express(data, n=3, res=None, today=None):
         label, price, estimated = _safe_double_chance(match)
         if not label or not price:
             continue
-        odds = match.get("odds") or []
-        p1 = _valid_decimal(odds[0] if len(odds) > 0 else None)
-        p2 = _valid_decimal(odds[2] if len(odds) > 2 else None)
-        market_probability = (1 / price) if estimated else (1 / price)
         candidates.append({
             "m": match,
             "pick": label,
@@ -578,25 +581,45 @@ def express(data, n=3, res=None, today=None):
             "estimated": estimated,
             "mk": "Двойной шанс",
             "tour": tournament.get("short") or tournament.get("name", ""),
-            "probability": market_probability,
+            "probability": 1 / price,
             "ai_confidence": max(
                 int((match.get("ai") or {}).get("conf", 0) or 0),
                 int((match.get("gpt") or {}).get("conf", 0) or 0),
             ),
         })
-
-    # Берём матчи с более высокой вероятностью события и не повторяем одну игру.
-    candidates.sort(key=lambda item: (-item["probability"], -item["ai_confidence"], item["m"].get("time") or "99:99"))
-    selected, seen = [], set()
-    for item in candidates:
-        key = (item["m"].get("date"), item["m"].get("home"), item["m"].get("away"))
-        if key in seen:
-            continue
-        selected.append(item)
-        seen.add(key)
-        if len(selected) >= n:
-            break
-    return selected
+    # Котировка с меньшим значением означает более вероятный исход.
+    candidates.sort(key=lambda item: (
+        -item["probability"],
+        -item["ai_confidence"],
+        item["m"].get("time") or "99:99",
+    ))
+    pool = candidates[:30]
+    try:
+        min_events = max(3, min(5, int(n)))
+    except (TypeError, ValueError):
+        min_events = 3
+    for count in range(min_events, min(5, len(pool)) + 1):
+        best = None
+        best_key = None
+        for combo in itertools.combinations(pool, count):
+            total = 1.0
+            for item in combo:
+                total *= item["odd"]
+            if total < 2.0:
+                continue
+            estimated_count = sum(bool(item.get("estimated")) for item in combo)
+            confidence = sum(item["ai_confidence"] for item in combo)
+            key = (
+                estimated_count,
+                total,
+                -confidence,
+                tuple(item["m"].get("time") or "99:99" for item in combo),
+            )
+            if best_key is None or key < best_key:
+                best, best_key = combo, key
+        if best:
+            return sorted(best, key=lambda item: item["m"].get("time") or "99:99")
+    return []
 
 
 def _format_pick_price(item):
@@ -607,12 +630,17 @@ def _format_pick_price(item):
 def screen_express(data, res=None, today=None):
     sel = express(data, 3, res=res, today=today)
     if len(sel) < 3:
-        return "⚡ <b>Экспресс дня — 3 события</b>\nПока недостаточно матчей с доступными коэффициентами двойного шанса. Экспресс появится, когда будут котировки минимум на три предстоящих матча."
+        return (
+            "⚡ <b>Экспресс дня</b>\n"
+            "Пока не нашлось 3–5 предстоящих матчей с коэффициентами, "
+            "которые дают общий кф не ниже 2.00. Неподтверждённый экспресс не публикуем."
+        )
 
     total = 1.0
     out = [
-        "⚡ <b>Экспресс дня — 3 события</b>",
-        "<i>Выбраны наиболее вероятные двойные шансы по котировкам 1X2. ≈ — расчётный коэффициент.</i>",
+        f"⚡ <b>Экспресс дня — {len(sel)} событий</b>",
+        "<i>Выбраны наиболее вероятные двойные шансы по котировкам 1X2. "
+        "≈ — расчётный коэффициент.</i>",
     ]
     for index, item in enumerate(sel, 1):
         total *= item["odd"]
@@ -623,8 +651,10 @@ def screen_express(data, res=None, today=None):
         )
     total_marker = "≈" if any(item.get("estimated") for item in sel) else ""
     out.append(f"\n<b>Общий коэффициент: {total_marker}{total:.2f}</b>")
-    out.append("<i>Вероятность экспресса ниже вероятности каждого отдельного события. Аналитика, не гарантия. 18+</i>")
+    out.append("<i>Минимальный общий коэффициент 2.00; максимум 5 событий. "
+               "Экспресс рискованнее одиночной ставки: должны пройти все выборы. 18+.</i>")
     return "\n".join(out)
+
 
 # ---------- обязательная подписка на канал/группу ----------
 async def is_subscribed(bot, uid):
@@ -941,7 +971,7 @@ def _daily_model_candidates(data, res, today):
     return candidates
 
 
-def _daily_predictions_block(data, res, today):
+def _daily_predictions_block(data, res, today, express_legs=None):
     candidates = _daily_model_candidates(data, res, today)
     out = []
     if candidates:
@@ -951,17 +981,16 @@ def _daily_predictions_block(data, res, today):
             meta.append(f"счёт ИИ {e(best['score'])}")
         if best["probability"]:
             meta.append(f"оценка модели {best['probability']}%")
-        elif best["confidence"]:
+        if best["confidence"]:
             meta.append(f"уверенность {best['confidence']}/5")
         if best["time"]:
             meta.append(e(best["time"]))
         suffix = " · " + " · ".join(meta) if meta else ""
-        title = "Выбор ИИ" if not best["fallback"] else "Осторожный выбор по котировкам для прогноза ИИ"
         price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
         out.extend([
-            f"🎯 <b>Лучший прогноз дня</b>",
+            "🎯 <b>Лучший прогноз дня</b>",
             f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
-            f"{title}: <b>{e(best['bet'])}</b> — кф <b>{price}</b>{suffix}",
+            f"Выбор ИИ: <b>{e(best['bet'])}</b> — кф <b>{price}</b>{suffix}",
         ])
     else:
         out.extend([
@@ -969,11 +998,10 @@ def _daily_predictions_block(data, res, today):
             "Пока нет прогноза на предстоящий матч с проверяемым коэффициентом.",
         ])
 
-    today_value = data.get("today") or today
-    legs = express(data, 3, res=res, today=today_value)
-    if len(legs) == 3:
+    legs = express_legs if express_legs is not None else express(data, 3, res=res, today=today)
+    if len(legs) >= 3:
         total = 1.0
-        out.append("\n⚡ <b>Экспресс дня — 3 события</b>")
+        out.append(f"\n⚡ <b>Экспресс дня — {len(legs)} события</b>")
         for index, item in enumerate(legs, 1):
             total *= item["odd"]
             price = _format_pick_price(item)
@@ -985,15 +1013,18 @@ def _daily_predictions_block(data, res, today):
         marker = "≈" if any(item.get("estimated") for item in legs) else ""
         out.append(f"<b>Общий коэффициент: {marker}{total:.2f}</b>")
         if any(item.get("estimated") for item in legs):
-            out.append("<i>≈ — расчётный коэффициент двойного шанса по котировкам 1X2, не прямая котировка букмекера.</i>")
+            out.append("<i>≈ — расчётный коэффициент двойного шанса по котировкам 1X2, "
+                       "а не прямая котировка букмекера.</i>")
     else:
-        out.append("\n⚡ <b>Экспресс дня — 3 события</b>")
-        out.append("Сегодня пока нет коэффициентов минимум на три предстоящих матча, поэтому непроверенные цены не публикуем.")
-    out.append("<i>Экспресс рискованнее одиночного события: должны пройти все три выбора. 18+</i>")
+        out.append("\n⚡ <b>Экспресс дня</b>")
+        out.append("Нет подходящей комбинации из 3–5 событий с общим коэффициентом от 2.00; "
+                   "непроверенные цены не публикуем.")
+    out.append("<i>Экспресс рискованнее одиночной ставки: должны пройти все выбранные события. 18+</i>")
     return "\n".join(out)
 
+
 def _daily_rating_block(res):
-    """Показывает полный рейтинг источников и отдельную статистику ИИ."""
+    """Полный рейтинг источников; текущая и историческая статистика ИИ разделены."""
     if not res:
         return "🏆 <b>Рейтинг прогнозистов</b>\nСтатистика пока недоступна."
 
@@ -1020,9 +1051,7 @@ def _daily_rating_block(res):
     out = ["🏆 <b>Рейтинг прогнозистов</b>"]
     done = res.get("done")
     if isinstance(done, list):
-        out.append(
-            f"<i>По {len(done)} матчам с результатом · источников: {len(sources)}</i>"
-        )
+        out.append(f"<i>По {len(done)} матчам с результатом · источников: {len(sources)}</i>")
 
     if sources:
         for index, row in enumerate(sources, 1):
@@ -1041,7 +1070,14 @@ def _daily_rating_block(res):
     else:
         out.append("Прогнозов с рассчитанным исходом пока нет.")
 
-    for key, label in (("ai75", "Claude ≥75%"), ("gpt75", "ChatGPT ≥75%")):
+    ai_rows = (
+        ("gpt60", "Локальная модель · текущая выборка"),
+        ("ai60", "Claude · текущая выборка"),
+        ("gpt75", "Локальная модель · архив ≥75%"),
+        ("ai75", "Claude · архив ≥75%"),
+    )
+    out.append("\n<b>ИИ — отдельная статистика</b>")
+    for key, label in ai_rows:
         value = res.get(key) or {}
         try:
             wins = int(value.get("win", 0) or 0)
@@ -1050,20 +1086,177 @@ def _daily_rating_block(res):
         except (TypeError, ValueError):
             wins = losses = pushes = 0
         total = wins + losses
-        if total:
-            pct = round(wins / total * 100)
-            out.append(
-                f"{'🤖' if key == 'ai75' else '🧠'} <b>{label}</b> — {pct}% "
-                f"({wins}–{losses}, {total} ставок"
-                + (f", возвратов {pushes}" if pushes else "")
-                + (") · мало данных" if total < 3 else ")")
-            )
-        else:
-            out.append(
-                f"{'🤖' if key == 'ai75' else '🧠'} <b>{label}</b> — "
-                "нет ставок от 75% с рассчитанным исходом."
-            )
+        pct = f"{round(wins / total * 100)}%" if total else "—"
+        details = f"{wins}–{losses}, {total} ставок"
+        if pushes:
+            details += f", возвратов {pushes}"
+        if total and total < 3:
+            details += ", мало данных"
+        out.append(f"• <b>{e(label)}</b> — {pct} ({details})")
+
+    out.append("<i>Возвраты не входят в процент; текущая выборка ИИ хранится отдельно от архива ≥75%. 18+</i>")
     return "\n".join(out)
+
+
+EXPRESS_HISTORY_FILE = os.environ.get(
+    "EXPRESS_HISTORY_FILE",
+    os.path.join(os.path.dirname(__file__), ".express_history.json"),
+)
+
+
+def _load_express_history():
+    try:
+        with open(EXPRESS_HISTORY_FILE, encoding="utf-8") as f:
+            value = json.load(f)
+        if isinstance(value, dict) and isinstance(value.get("days"), list):
+            return value
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"days": []}
+
+
+def _norm_team_name(value):
+    return re.sub(r"[^a-zа-яё0-9]", "", str(value or "").lower().replace("ё", "е"))
+
+
+def _express_settlement(record, res):
+    legs = record.get("legs") or []
+    recent = (res or {}).get("recent") or []
+    by_key = {
+        (str(item.get("date") or ""), _norm_team_name(item.get("home")),
+         _norm_team_name(item.get("away"))): item
+        for item in recent
+    }
+    settled = []
+    for leg in legs:
+        key = (str(leg.get("date") or record.get("date") or ""),
+               _norm_team_name(leg.get("home")), _norm_team_name(leg.get("away")))
+        result = by_key.get(key)
+        score = str((result or {}).get("score") or (result or {}).get("ft") or "")
+        score_match = re.match(r"^\s*(\d+)\s*[:\-]\s*(\d+)", score)
+        if not score_match:
+            settled.append({"leg": leg, "status": "pending", "score": ""})
+            continue
+        home_goals, away_goals = int(score_match.group(1)), int(score_match.group(2))
+        market = _pick_key(leg.get("pick"), {"home": leg.get("home"), "away": leg.get("away")})
+        if market == "dc_1x":
+            status = "win" if home_goals >= away_goals else "lose"
+        elif market == "dc_x2":
+            status = "win" if away_goals >= home_goals else "lose"
+        else:
+            status = "pending"
+        settled.append({
+            "leg": leg,
+            "status": status,
+            "score": f"{home_goals}:{away_goals}",
+        })
+    if not legs:
+        overall = "not_posted"
+    elif any(item["status"] == "lose" for item in settled):
+        overall = "lose"
+    elif settled and all(item["status"] == "win" for item in settled):
+        overall = "win"
+    else:
+        overall = "pending"
+    record["settlement"] = overall
+    record["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    return settled, overall
+
+
+def _daily_express_result_block(history, res, today):
+    days = history.get("days") or []
+    yesterday = (datetime.date.fromisoformat(today) - datetime.timedelta(days=1)).isoformat()
+    record = next((item for item in days if item.get("date") == yesterday), None)
+    title_date = yesterday
+    if record is None:
+        older = sorted(
+            (item for item in days if item.get("date", "") < today and item.get("legs")),
+            key=lambda item: item.get("date", ""),
+            reverse=True,
+        )
+        record = next((item for item in older if item.get("settlement") == "pending"), None)
+        if record is None:
+            return "📊 <b>Результат вчерашнего экспресса</b>\nСохранённого купона за вчера нет; начинаем вести историю с сегодняшнего поста."
+        title_date = record.get("date") or yesterday
+
+    if not record.get("legs"):
+        return (
+            f"📊 <b>Экспресс за {e(dlabel(title_date))}</b>\n"
+            "Не публиковался: не нашлось подходящей комбинации из 3–5 событий с общим коэффициентом от 2.00."
+        )
+
+    settled, overall = _express_settlement(record, res)
+    total = float(record.get("total") or 1)
+    approx = "≈" if record.get("estimated") else ""
+    out = [f"📊 <b>Результат экспресса за {e(dlabel(title_date))}</b>"]
+    for item in settled:
+        leg = item["leg"]
+        icon = "✅" if item["status"] == "win" else ("❌" if item["status"] == "lose" else "⏳")
+        score = f" · {e(item['score'])}" if item["score"] else " · результат ожидается"
+        out.append(
+            f"{icon} {e(leg.get('home'))} — {e(leg.get('away'))}{score}; "
+            f"{e(leg.get('pick'))} · кф {('≈' if leg.get('estimated') else '')}{float(leg.get('odd') or 0):.2f}"
+        )
+    if overall == "win":
+        payout = round(1000 * total)
+        out.append(f"<b>Экспресс прошёл · кф {approx}{total:.2f} · при ставке 1 000 ₽ выплата ≈{payout:,} ₽, чистый результат +{payout - 1000:,} ₽.</b>".replace(",", " "))
+    elif overall == "lose":
+        out.append("<b>Экспресс не прошёл · при ставке 1 000 ₽ выплата 0 ₽, результат −1 000 ₽.</b>")
+    else:
+        completed = sum(item["status"] in ("win", "lose") for item in settled)
+        out.append(f"<b>Пока рассчитано {completed} из {len(settled)} событий; полный итог появится после завершения всех матчей.</b>")
+    return "\n".join(out)
+
+
+def _split_telegram_text(text, limit=3800):
+    lines = str(text).splitlines()
+    chunks, current = [], ""
+    for line in lines:
+        addition = line if not current else "\n" + line
+        if current and len(current) + len(addition) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += addition
+    if current:
+        chunks.append(current)
+    return chunks or [str(text)]
+
+
+def _save_express_history(history, today, legs):
+    days = [item for item in history.get("days", []) if item.get("date") != today]
+    record_legs = []
+    total = 1.0
+    estimated = False
+    for item in legs:
+        total *= float(item["odd"])
+        estimated = estimated or bool(item.get("estimated"))
+        match = item["m"]
+        record_legs.append({
+            "date": today,
+            "home": str(match.get("home") or ""),
+            "away": str(match.get("away") or ""),
+            "pick": str(item.get("pick") or ""),
+            "odd": float(item["odd"]),
+            "estimated": bool(item.get("estimated")),
+            "tour": str(item.get("tour") or ""),
+            "time": str(match.get("time") or ""),
+        })
+    days.append({
+        "date": today,
+        "legs": record_legs,
+        "total": round(total, 4) if record_legs else None,
+        "estimated": estimated,
+        "posted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "settlement": "pending" if record_legs else "not_posted",
+    })
+    history["days"] = sorted(days, key=lambda item: item.get("date", ""))[-30:]
+    directory = os.path.dirname(EXPRESS_HISTORY_FILE) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = EXPRESS_HISTORY_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, EXPRESS_HISTORY_FILE)
 
 
 async def post_daily(bot):
@@ -1079,13 +1272,18 @@ async def post_daily(bot):
             datetime.timezone(datetime.timedelta(hours=3))
         ).date().isoformat()
     rows = [m for (t, i, m) in all_matches(data) if m.get("date") == today]
+    express_legs = express(data, 3, res=res, today=today)
+    history = _load_express_history()
+    previous_result = _daily_express_result_block(history, res, today)
 
     parts = [
         "🔥 <b>Капер ИИ</b> — прогнозы на сегодня",
         f"⚽ Матчей сегодня: <b>{len(rows)}</b> · {e(dlabel(today))}",
         f"🔄 Данные обновлены: {e(_format_daily_timestamp(data.get('updated')) or 'время не указано')}",
         "",
-        _daily_predictions_block(data, res, today),
+        _daily_predictions_block(data, res, today, express_legs),
+        "",
+        previous_result,
         "",
         _daily_rating_block(res),
     ]
@@ -1094,10 +1292,17 @@ async def post_daily(bot):
     parts.append("\nВсе матчи и подробные прогнозы — в приложении 👇\n<i>18+. Аналитика, не гарантия.</i>")
     kb = InlineKeyboardBuilder()
     kb.button(text="⚽ Открыть в боте", url=bot_link())
-    await bot.send_message(REQUIRED_CHAT, "\n".join(parts),
-                           reply_markup=kb.as_markup(), disable_web_page_preview=True)
-    print(f"Ежедневный пост отправлен: {today}, матчей {len(rows)}.")
+    chunks = _split_telegram_text("\n".join(parts))
+    for index, chunk in enumerate(chunks):
+        kwargs = {"disable_web_page_preview": True}
+        if index == len(chunks) - 1:
+            kwargs["reply_markup"] = kb.as_markup()
+        await bot.send_message(REQUIRED_CHAT, chunk, **kwargs)
+
+    _save_express_history(history, today, express_legs)
+    print(f"Ежедневный пост отправлен: {today}, матчей {len(rows)}, экспрессов {len(express_legs)} событий.")
     return True
+
 
 POST_TIMES = [(12, 30)]  # публикуем после сбора прогнозов в 12:00 МСК
 async def channel_poster(bot):
