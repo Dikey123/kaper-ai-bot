@@ -468,6 +468,32 @@ def rating_kb(page, total_pages):
     kb.button(text="⬅️ Главное меню", callback_data="menu")
     return kb.as_markup()
 
+def ai_bucket(res, key):
+    value = (res or {}).get(key) or {}
+    try:
+        wins = int(value.get("win", 0) or 0)
+        losses = int(value.get("lose", 0) or 0)
+        pushes = int(value.get("push", 0) or 0)
+    except (TypeError, ValueError):
+        wins = losses = pushes = 0
+    total = wins + losses
+    return {
+        "win": wins,
+        "lose": losses,
+        "push": pushes,
+        "n": total,
+        "pct": round(wins / total * 100) if total else None,
+    }
+
+def ai_bucket_text(label, value):
+    pct = f"{value['pct']}%" if value["pct"] is not None else "—"
+    details = f"{value['win']}–{value['lose']}, {value['n']} ставок"
+    if value["push"]:
+        details += f", возвратов {value['push']}"
+    if 0 < value["n"] < 3:
+        details += ", мало данных"
+    return f"{label}: {pct} ({details})"
+
 def screen_rating(res, page=0):
     if not res:
         return ("Статистика ещё собирается — рейтинг появится после первых сыгранных матчей.", main_kb())
@@ -480,20 +506,26 @@ def screen_rating(res, page=0):
                      "lose": losses, "push": pushes,
                      "pct": round(wins/n*100) if n else 0,
                      "w": wilson(wins,n), "n": n})
-    for key, label in (
-        ("gpt60", "🧠 Локальная модель · текущая выборка"),
-        ("ai60", "🤖 Claude · текущая выборка"),
-        ("gpt75", "🧠 Локальная модель · архив ≥75%"),
-        ("ai75", "🤖 Claude · архив ≥75%"),
+    for current_key, archive_key, label in (
+        ("gpt60", "gpt75", "🧠 Локальная модель"),
+        ("ai60", "ai75", "🤖 Claude"),
     ):
-        value = res.get(key) or {"win":0,"lose":0,"push":0}
-        wins = int(value.get("win",0) or 0)
-        losses = int(value.get("lose",0) or 0)
-        pushes = int(value.get("push",0) or 0)
-        n = wins + losses
-        rows.append({"src": label, "reg": "ai", "win": wins, "lose": losses,
-                     "push": pushes, "pct": round(wins/n*100) if n else 0,
-                     "w": wilson(wins,n), "n": n, "ai": True})
+        current = ai_bucket(res, current_key)
+        archive = ai_bucket(res, archive_key)
+        ranked = current if current["n"] else archive
+        rows.append({
+            "src": label,
+            "reg": "ai",
+            "win": ranked["win"],
+            "lose": ranked["lose"],
+            "push": ranked["push"],
+            "pct": ranked["pct"] or 0,
+            "w": wilson(ranked["win"], ranked["n"]),
+            "n": ranked["n"],
+            "ai": True,
+            "ai_current": current,
+            "ai_archive": archive,
+        })
     rows.sort(key=lambda r: (-r["w"], -r["n"], -r["pct"]))
     page_size = 15
     total_pages = max(1, (len(rows) + page_size - 1) // page_size)
@@ -505,7 +537,14 @@ def screen_rating(res, page=0):
     last = min(first + page_size, len(rows))
     out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всех строк: {len(rows)} · страница {page+1}/{total_pages}</i>\n"]
     for i, r in enumerate(rows[first:last], first + 1):
-        tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
+        if r.get("ai"):
+            out.append(
+                f"{i}. <b>{e(r['src'])}</b> — "
+                f"{ai_bucket_text('текущая выборка', r['ai_current'])}; "
+                f"{ai_bucket_text('архив ≥75%', r['ai_archive'])}"
+            )
+            continue
+        tag = " 🇷🇺" if r["reg"] == "ru" else " 🇪🇺"
         small = " · мало данных" if r["n"] < 3 else ""
         push = f" · возвратов {r['push']}" if r["push"] else ""
         pct = f"{r['pct']}%" if r["n"] else "—"
@@ -1209,28 +1248,18 @@ def _daily_rating_block(res):
         out.append("Прогнозов с рассчитанным исходом пока нет.")
 
     ai_rows = (
-        ("gpt60", "Локальная модель · текущая выборка"),
-        ("ai60", "Claude · текущая выборка"),
-        ("gpt75", "Локальная модель · архив ≥75%"),
-        ("ai75", "Claude · архив ≥75%"),
+        ("gpt60", "gpt75", "🧠 Локальная модель"),
+        ("ai60", "ai75", "🤖 Claude"),
     )
     out.append("\n<b>ИИ — отдельная статистика</b>")
-    for key, label in ai_rows:
-        value = res.get(key) or {}
-        try:
-            wins = int(value.get("win", 0) or 0)
-            losses = int(value.get("lose", 0) or 0)
-            pushes = int(value.get("push", 0) or 0)
-        except (TypeError, ValueError):
-            wins = losses = pushes = 0
-        total = wins + losses
-        pct = f"{round(wins / total * 100)}%" if total else "—"
-        details = f"{wins}–{losses}, {total} ставок"
-        if pushes:
-            details += f", возвратов {pushes}"
-        if total and total < 3:
-            details += ", мало данных"
-        out.append(f"• <b>{e(label)}</b> — {pct} ({details})")
+    for current_key, archive_key, label in ai_rows:
+        current = ai_bucket(res, current_key)
+        archive = ai_bucket(res, archive_key)
+        out.append(
+            f"• <b>{e(label)}</b> — "
+            f"{ai_bucket_text('текущая выборка', current)}; "
+            f"{ai_bucket_text('архив ≥75%', archive)}"
+        )
 
 
     return "\n".join(out)
