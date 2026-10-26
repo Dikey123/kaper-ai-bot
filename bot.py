@@ -39,7 +39,7 @@ def channel_link():
         return "https://t.me/" + REQUIRED_CHAT[1:]
     return ""
 
-_cache = {"t": 0, "data": None, "res": None}
+_cache = {"t": 0, "data": None, "res": None, "source": None}
 
 # ---------- база данных (Supabase Postgres); всё отказоустойчиво ----------
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -112,6 +112,19 @@ async def db_touch_user(user):
     except Exception as ex:
         print("DB user error:", ex)
 
+async def db_status():
+    if not _pool:
+        return {"connected": False}
+    out = {"connected": True, "snapshots": {}, "users": None}
+    try:
+        async with _pool.acquire() as c:
+            for r in await c.fetch("SELECT key, updated_at FROM snapshots"):
+                out["snapshots"][r["key"]] = r["updated_at"].isoformat()
+            out["users"] = await c.fetchval("SELECT count(*) FROM users")
+    except Exception as ex:
+        out["error"] = str(ex)
+    return out
+
 MON = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
 DAYS = ["воскресенье","понедельник","вторник","среда","четверг","пятница","суббота"]
 
@@ -183,14 +196,16 @@ async def get_data(force=False):
     data = await db_get_snapshot("data")
     res  = await db_get_snapshot("results")
     gpt  = await db_get_snapshot("gpt")
+    src = "db" if data else None
     if not data:
         async with aiohttp.ClientSession() as s:
             data = await fetch_json(s, BASE + "data.json")
             res  = await fetch_json(s, BASE + "results.json")
             gpt  = await fetch_json(s, BASE + "gpt.json")
+        src = "site"
     if data:
         merge_gpt(data, gpt)
-        _cache.update(t=now, data=data, res=res)
+        _cache.update(t=now, data=data, res=res, source=src)
     return _cache["data"], _cache["res"]
 
 def all_matches(data):
@@ -945,6 +960,15 @@ CORS = {"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"}
 async def _health(request):
     return web.Response(text="Капер ИИ — бот работает. 18+")
 
+async def _status(request):
+    data, _ = await get_data()
+    st = await db_status()
+    return web.json_response({
+        "source": _cache.get("source"),   # "db" = читаем из базы, "site" = запасной вариант
+        "has_data": bool(data),
+        "db": st,
+    }, headers=CORS)
+
 async def api_data(request):
     uid = check_init_data(request.query.get("initData", ""), TOKEN)
     if not uid:
@@ -967,6 +991,7 @@ async def start_web(bot):
     app["bot"] = bot
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
+    app.router.add_get("/status", _status)
     app.router.add_get("/api/data", api_data)
     app.router.add_options("/api/data", api_options)
     runner = web.AppRunner(app)
