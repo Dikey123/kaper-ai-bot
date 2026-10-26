@@ -1102,6 +1102,51 @@ def _daily_rating_block(res):
     return "\n".join(out)
 
 
+def _daily_ai_results_block(res, today):
+    """Поматчевый разбор: какие ставки ИИ зашли/не зашли во вчерашний (или последний сыгранный) день."""
+    recent = (res or {}).get("recent") or []
+    if not recent:
+        return ""
+
+    def picks_for(date):
+        return [
+            r for r in recent
+            if r.get("date") == date
+            and (r.get("gpt_bet") or "").strip()
+            and r.get("gpt60") in ("win", "lose")
+        ]
+
+    try:
+        yesterday = (datetime.date.fromisoformat(today) - datetime.timedelta(days=1)).isoformat()
+    except (TypeError, ValueError):
+        return ""
+    day = yesterday
+    picks = picks_for(yesterday)
+    if not picks:
+        past = sorted(
+            {r.get("date") for r in recent if r.get("date") and r.get("date") < today},
+            reverse=True,
+        )
+        for d in past:
+            p = picks_for(d)
+            if p:
+                day, picks = d, p
+                break
+    if not picks:
+        return ""
+
+    win = sum(1 for r in picks if r.get("gpt60") == "win")
+    total = len(picks)
+    out = [f"📋 <b>Итоги ставок ИИ за {e(dlabel(day))}:</b>"]
+    for r in picks[:8]:
+        icon = "✅" if r.get("gpt60") == "win" else "❌"
+        out.append(f"{icon} {e(r.get('home'))} {e(r.get('score', ''))} {e(r.get('away'))} · {e(r.get('gpt_bet'))}")
+    if total > 8:
+        out.append(f"<i>…и ещё {total - 8}</i>")
+    out.append(f"<b>Зашло {win} из {total}</b>")
+    return "\n".join(out)
+
+
 EXPRESS_HISTORY_FILE = os.environ.get(
     "EXPRESS_HISTORY_FILE",
     os.path.join(os.path.dirname(__file__), ".express_history.json"),
@@ -1287,6 +1332,7 @@ async def post_daily(bot):
         "",
         _daily_predictions_block(data, res, today, express_legs),
         "",
+    ] + ([_daily_ai_results_block(res, today), ""] if _daily_ai_results_block(res, today) else []) + [
         previous_result,
         "",
         _daily_rating_block(res),
@@ -1308,7 +1354,7 @@ async def post_daily(bot):
     return True
 
 
-POST_TIMES = [(12, 30)]  # публикуем после сбора прогнозов в 12:00 МСК
+POST_TIMES = [(12, 0)]  # ежедневный пост в канал в 12:00 МСК
 async def channel_poster(bot):
     if not REQUIRED_CHAT:
         return
