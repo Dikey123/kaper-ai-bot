@@ -12,7 +12,7 @@
 Токен НЕ хранится в коде. Передаётся через переменную окружения BOT_TOKEN.
 Запуск локально:   BOT_TOKEN=xxxx python bot.py
 """
-import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime, itertools
+import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime, itertools, math
 import aiohttp
 from aiohttp import web
 from urllib.parse import parse_qsl
@@ -146,7 +146,7 @@ DAYS = ["воскресенье","понедельник","вторник","ср
 def e(s):  # экранирование HTML
     return html.escape(str(s if s is not None else ""))
 
-AI_MIN_PROBABILITY = 60
+AI_MIN_PROBABILITY = 70
 
 def ai_probability(opinion):
     if not isinstance(opinion, dict):
@@ -331,22 +331,32 @@ def bar(cnt):
     return f"🟩{cnt['1']} ⬜{cnt['X']} 🟦{cnt['2']}"
 
 def opinion_block(src, emoji, name, match=None):
-    """Показывает опубликованную ставку ИИ при допустимой оценке и коэффициенте."""
+    """Всегда показывает мнение и счёт; ставку — только с порогом и котировкой."""
     if not src:
         return ""
-    if not ai_bet_eligible(src):
-        return f"\n{emoji} <b>Мнение {name}</b>: нет опубликованной ставки с подходящим коэффициентом."
     bet = str(src.get("bet") or src.get("pick") or "").strip()
-    price, estimated = _price_for_pick(match, bet) if match else (None, False)
-    if not price:
-        return f"\n{emoji} <b>Мнение {name}</b>: котировка для выбранного исхода не найдена, ставка пропущена."
-    marker = "≈" if estimated else ""
+    eligible = ai_bet_eligible(src)
+    price, estimated = _price_for_pick(match, bet) if match and eligible else (None, False)
+    opinion_text = str(src.get("text") or "")
+    opinion_text = re.sub(r"Выбор модели\s*[—:-]\s*[^\n]*", "", opinion_text, flags=re.I)
+    opinion_text = re.sub(r"Модель не выбрала ставку\.?", "", opinion_text, flags=re.I)
     opinion_text = re.sub(
-        r"\s*Оценка модели\s*[—:-]?\s*\d+\s*%\s*;?\s*это прогноз, не факт\.?",
-        "", str(src.get("text") or ""), flags=re.I,
+        r"(?:Оценка модели|уверенность модели)\s*[—:-]?\s*\d{1,3}\s*%[^.\n]*(?:\.|$)",
+        "", opinion_text, flags=re.I,
     ).strip()
-    out = f"\n{emoji} <b>Мнение {name}</b>: счёт <b>{e(src.get('score',''))}</b>\n{e(opinion_text)}"
-    out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b>"
+    opinion_text = re.sub(r"\s{2,}", " ", opinion_text)
+    if not opinion_text:
+        opinion_text = "Аналитическое мнение по матчу сформировано."
+    score = str(src.get("score") or "").strip()
+    out = f"\n{emoji} <b>Мнение {name}</b>"
+    if score:
+        out += f": счёт <b>{e(score)}</b>"
+    out += "\n" + e(opinion_text)
+    if eligible and price:
+        marker = "≈" if estimated else ""
+        out += f"\nСтавка {name}: <b>{e(bet)}</b> — кф <b>{marker}{price:.2f}</b>"
+    else:
+        out += "\nСтавка не отобрана."
     sources = [s for s in (src.get("sources") or []) if isinstance(s, dict) and str(s.get("url") or "").startswith(("https://", "http://"))][:4]
     if sources:
         out += "\nИсточники: " + " · ".join(f'<a href="{e(s["url"])}">{e(s.get("title") or s["url"])}</a>' for s in sources)
@@ -379,9 +389,6 @@ def screen_match(t, m, res=None):
     score = score_for_match(m, res)
     if score:
         lines.append(f"🏁 Итоговый счёт: <b>{e(score)}</b>")
-    quote_block = odds_summary(m)
-    if quote_block:
-        lines.append("\n" + quote_block)
     if m.get("context"):
         lines.append("\n" + e(m["context"]))
     # эксперты
@@ -506,13 +513,14 @@ def screen_rating(res, page=0):
                      "lose": losses, "push": pushes,
                      "pct": round(wins/n*100) if n else 0,
                      "w": wilson(wins,n), "n": n})
-    for current_key, archive_key, label in (
-        ("gpt60", "gpt75", "🧠 Локальная модель"),
-        ("ai60", "ai75", "🤖 Claude"),
+    for current_key, legacy_key, archive_key, label in (
+        ("gpt70", "gpt60", "gpt75", "🧠 Локальная модель"),
+        ("ai70", "ai60", "ai75", "🤖 Claude"),
     ):
         current = ai_bucket(res, current_key)
+        legacy = ai_bucket(res, legacy_key)
         archive = ai_bucket(res, archive_key)
-        ranked = current if current["n"] else archive
+        ranked = current if current["n"] else (legacy if legacy["n"] else archive)
         rows.append({
             "src": label,
             "reg": "ai",
@@ -524,6 +532,7 @@ def screen_rating(res, page=0):
             "n": ranked["n"],
             "ai": True,
             "ai_current": current,
+            "ai_legacy": legacy,
             "ai_archive": archive,
         })
     rows.sort(key=lambda r: (-r["w"], -r["n"], -r["pct"]))
@@ -540,8 +549,9 @@ def screen_rating(res, page=0):
         if r.get("ai"):
             out.append(
                 f"{i}. <b>{e(r['src'])}</b> — "
-                f"{ai_bucket_text('текущая выборка', r['ai_current'])}; "
-                f"{ai_bucket_text('архив ≥75%', r['ai_archive'])}"
+                f"{ai_bucket_text('новая выборка', r['ai_current'])}; "
+                f"{ai_bucket_text('прежняя выборка', r['ai_legacy'])}; "
+                f"{ai_bucket_text('архив', r['ai_archive'])}"
             )
             continue
         tag = " 🇷🇺" if r["reg"] == "ru" else " 🇪🇺"
@@ -562,7 +572,7 @@ def mkt(pick):
     if "обе заб" in p or " оз " in p: return "Обе забьют"
     if "тотал больш" in p or re.search(r" тб[ 0-9(]", p) or "больше" in p: return "Тотал больше"
     if "тотал мен" in p or re.search(r" тм[ 0-9(]", p) or "меньше" in p: return "Тотал меньше"
-    if "фора" in p or " ф1" in p or " ф2" in p: return "Фора"
+    if "фора" in p or " ф1" in p or " ф2" in p or re.search(r"\bф[12]\s*\(", p): return "Фора"
     if "двойн" in p or "1х" in p or "х2" in p or "не проигр" in p: return "Двойной шанс"
     if "побед" in p or " п1 " in p or " п2 " in p: return "Исход"
     return "Ставка"
@@ -575,20 +585,20 @@ def parse_k(k):
         return None
 
 def _pick_key(pick, match=None):
-    """Нормализует прогноз до рынка, чтобы не подставлять цену от другого исхода."""
-    raw = str(pick or "").strip().lower().replace("ё", "е")
-    norm = re.sub(r"\s+", " ", raw.replace("х", "x"))
+    """Нормализует ставки, поддерживаемые расчётом результата матча."""
+    raw = str(pick or "").strip().lower().replace("ё", "е").replace("−", "-").replace("–", "-")
+    norm = re.sub(r"\s+", " ", raw.replace("х", "x").replace(",", "."))
     if not norm:
         return None
 
-    if re.search(r"(?<!\d)1\s*x(?!\d)|двойн.*1\s*x|1\s*х", raw) or ("не проигра" in raw and "хозя" in raw):
+    if re.search(r"(?<!\d)1\s*x(?!\d)|двойн.*1\s*x|1\s*х", raw) or ("не проигра" in raw and ("хозя" in raw or "дома" in raw)):
         return "dc_1x"
     if re.search(r"(?<!\d)x\s*2(?!\d)|двойн.*x\s*2|х\s*2", norm) or ("не проигра" in raw and ("гост" in raw or "выезд" in raw)):
         return "dc_x2"
     if re.search(r"(?<!\d)1\s*2(?!\d)", norm) or "двойн шанс 12" in norm:
         return "dc_12"
 
-    if "обе заб" in raw or re.search(r"(?<![а-я])оз(?![а-я])", raw):
+    if "обе заб" in raw or "оба заб" in raw or re.search(r"(?<![а-я])оз(?![а-я])", raw):
         return "btts_no" if re.search(r"\b(нет|no)\b|не забьют|оз нет", raw) else "btts_yes"
 
     total_side = None
@@ -597,16 +607,28 @@ def _pick_key(pick, match=None):
     elif re.search(r"\b(тм|меньше|under)\b", norm) or "тотал меньше" in norm:
         total_side = "under"
     if total_side:
-        match_line = re.search(r"(?:тб|тм|больше|меньше|over|under|тотал\s+(?:больше|меньше))\s*([0-9]+(?:[.,][0-9]+)?)", norm)
-        line = match_line.group(1).replace(",", ".") if match_line else ""
-        return f"total_{total_side}_{line}"
+        match_line = re.search(r"(?:тб|тм|больше|меньше|over|under|тотал(?:\s+голов?)?\s+(?:больше|меньше))\s*([0-9]+(?:\.[0-9]+)?)", norm)
+        if not match_line:
+            return None
+        return f"total_{total_side}_{match_line.group(1)}"
 
+    side = None
+    if re.search(r"(?:фора\s*(?:1|хозяев|дома)|ф\s*1|ф1)", raw):
+        side = 1
+    elif re.search(r"(?:фора\s*(?:2|гостей|в гостях)|ф\s*2|ф2)", raw):
+        side = 2
+    if side:
+        handicap = re.search(r"(?:фора\s*(?:1|2|хозяев|гостей|дома|в гостях)|ф\s*[12]|ф[12])\s*\(?\s*([+-]?[0-9]+(?:\.[0-9]+)?)", norm)
+        if not handicap:
+            return None
+        return f"handicap_{side}_{handicap.group(1)}"
+
+    if raw in ("1", "п1") or re.search(r"\bп1\b", norm) or "победа хозяев" in raw or (match and match.get("home") and "победа" in raw and str(match["home"]).lower() in raw):
+        return "result_1"
+    if raw in ("2", "п2") or re.search(r"\bп2\b", norm) or "победа гостей" in raw or (match and match.get("away") and "победа" in raw and str(match["away"]).lower() in raw):
+        return "result_2"
     if "ничья" in raw or "draw" in raw or re.fullmatch(r"[xх]", raw):
         return "result_x"
-    if re.search(r"\bп1\b", norm) or "победа хозяев" in raw or (match and match.get("home") and "победа" in raw and str(match["home"]).lower() in raw):
-        return "result_1"
-    if re.search(r"\bп2\b", norm) or "победа гостей" in raw or (match and match.get("away") and "победа" in raw and str(match["away"]).lower() in raw):
-        return "result_2"
     return None
 
 
@@ -709,7 +731,7 @@ def _upcoming_today(match, today, res=None):
 
 
 def express(data, n=3, res=None, today=None):
-    """Подбирает 3–5 наиболее вероятных разных матчей с общим кф не ниже 2.00."""
+    """Подбирает подтверждённые ставки разных рынков из 3–5 матчей; купон не ниже 2.00."""
     if not data:
         return []
     today = today or data.get("today") or datetime.datetime.now(
@@ -719,26 +741,59 @@ def express(data, n=3, res=None, today=None):
     for tournament, _, match in all_matches(data):
         if not _upcoming_today(match, today, res):
             continue
-        label, price, estimated = _safe_double_chance(match)
-        if not label or not price:
-            continue
-        candidates.append({
-            "m": match,
-            "pick": label,
-            "odd": price,
-            "estimated": estimated,
-            "mk": "Двойной шанс",
-            "tour": tournament.get("short") or tournament.get("name", ""),
-            "probability": 1 / price,
-            "ai_confidence": max(
-                int((match.get("ai") or {}).get("conf", 0) or 0),
-                int((match.get("gpt") or {}).get("conf", 0) or 0),
-            ),
-        })
-    # Котировка с меньшим значением означает более вероятный исход.
+        options = {}
+
+        def add_option(pick, price, estimated=False, support=0, ai_confidence=0):
+            key = _pick_key(pick, match)
+            if not key or not price or estimated:
+                return
+            item = options.get(key)
+            if item is None:
+                item = {
+                    "m": match, "pick": str(pick), "odd": price, "estimated": False,
+                    "mk": mkt(pick), "tour": tournament.get("short") or tournament.get("name", ""),
+                    "support": 0, "ai_confidence": 0, "probability": 1 / price,
+                }
+                options[key] = item
+            item["support"] += support
+            item["ai_confidence"] = max(item["ai_confidence"], ai_confidence)
+            if price > item["odd"]:
+                item["odd"] = price
+                if ai_confidence:
+                    item["pick"] = str(pick)
+            item["probability"] = 1 / item["odd"]
+
+        for tip in (match.get("tips") or []):
+            pick = str(tip.get("pick") or "").strip()
+            price = _valid_decimal(tip.get("k"))
+            if pick and price:
+                add_option(pick, price, support=1)
+
+        for opinion in (match.get("ai") or {}, match.get("gpt") or {}):
+            if not ai_bet_eligible(opinion):
+                continue
+            pick = str(opinion.get("bet") or opinion.get("pick") or "").strip()
+            price, estimated = _price_for_pick(match, pick)
+            try:
+                confidence = int(ai_probability(opinion) or 0)
+            except (TypeError, ValueError):
+                confidence = 0
+            if pick and price and confidence >= AI_MIN_PROBABILITY:
+                add_option(pick, price, estimated=estimated, ai_confidence=confidence)
+
+        if options:
+            # На матч оставляем один рынок: приоритет подтверждённому прогнозу ИИ,
+            # затем консенсусу источников и более вероятному исходу.
+            chosen = sorted(
+                options.values(),
+                key=lambda item: (-item["ai_confidence"], -item["support"], -item["probability"]),
+            )[0]
+            candidates.append(chosen)
+
     candidates.sort(key=lambda item: (
-        -item["probability"],
         -item["ai_confidence"],
+        -item["support"],
+        -item["probability"],
         item["m"].get("time") or "99:99",
     ))
     pool = candidates[:30]
@@ -787,8 +842,7 @@ def screen_express(data, res=None, today=None):
     total = 1.0
     out = [
         f"⚡ <b>Экспресс дня — {len(sel)} событий</b>",
-        "<i>Выбраны наиболее вероятные двойные шансы по котировкам 1X2. "
-        "≈ — расчётный коэффициент.</i>",
+        "<i>Подобраны рынки с подтверждёнными коэффициентами: исходы, тоталы, форы и другие доступные ставки.</i>",
     ]
     for index, item in enumerate(sel, 1):
         total *= item["odd"]
@@ -1248,17 +1302,19 @@ def _daily_rating_block(res):
         out.append("Прогнозов с рассчитанным исходом пока нет.")
 
     ai_rows = (
-        ("gpt60", "gpt75", "🧠 Локальная модель"),
-        ("ai60", "ai75", "🤖 Claude"),
+        ("gpt70", "gpt60", "gpt75", "🧠 Локальная модель"),
+        ("ai70", "ai60", "ai75", "🤖 Claude"),
     )
     out.append("\n<b>ИИ — отдельная статистика</b>")
-    for current_key, archive_key, label in ai_rows:
+    for current_key, legacy_key, archive_key, label in ai_rows:
         current = ai_bucket(res, current_key)
+        legacy = ai_bucket(res, legacy_key)
         archive = ai_bucket(res, archive_key)
         out.append(
             f"• <b>{e(label)}</b> — "
-            f"{ai_bucket_text('текущая выборка', current)}; "
-            f"{ai_bucket_text('архив ≥75%', archive)}"
+            f"{ai_bucket_text('новая выборка', current)}; "
+            f"{ai_bucket_text('прежняя выборка', legacy)}; "
+            f"{ai_bucket_text('архив', archive)}"
         )
 
 
@@ -1276,7 +1332,7 @@ def _daily_ai_results_block(res, today):
             r for r in recent
             if r.get("date") == date
             and (r.get("gpt_bet") or "").strip()
-            and r.get("gpt60") in ("win", "lose")
+            and (r.get("gpt70") or r.get("gpt60")) in ("win", "lose", "push")
         ]
 
     try:
@@ -1298,11 +1354,13 @@ def _daily_ai_results_block(res, today):
     if not picks:
         return ""
 
-    win = sum(1 for r in picks if r.get("gpt60") == "win")
+    result_of = lambda row: row.get("gpt70") or row.get("gpt60")
+    win = sum(1 for r in picks if result_of(r) == "win")
     total = len(picks)
     out = [f"📋 <b>Итоги ставок ИИ за {e(dlabel(day))}:</b>"]
     for r in picks[:8]:
-        icon = "✅" if r.get("gpt60") == "win" else "❌"
+        result = result_of(r)
+        icon = "✅" if result == "win" else ("↩️" if result == "push" else "❌")
         out.append(f"{icon} {e(r.get('home'))} {e(r.get('score', ''))} {e(r.get('away'))} · {e(r.get('gpt_bet'))}")
     if total > 8:
         out.append(f"<i>…и ещё {total - 8}</i>")
@@ -1351,10 +1409,33 @@ def _express_settlement(record, res):
             continue
         home_goals, away_goals = int(score_match.group(1)), int(score_match.group(2))
         market = _pick_key(leg.get("pick"), {"home": leg.get("home"), "away": leg.get("away")})
+        total_goals = home_goals + away_goals
         if market == "dc_1x":
             status = "win" if home_goals >= away_goals else "lose"
         elif market == "dc_x2":
             status = "win" if away_goals >= home_goals else "lose"
+        elif market == "dc_12":
+            status = "win" if home_goals != away_goals else "lose"
+        elif market == "result_1":
+            status = "win" if home_goals > away_goals else "lose"
+        elif market == "result_x":
+            status = "win" if home_goals == away_goals else "lose"
+        elif market == "result_2":
+            status = "win" if away_goals > home_goals else "lose"
+        elif market and market.startswith(("total_over_", "total_under_")):
+            side, _, raw_line = market.split("_", 2)
+            line = float(raw_line)
+            value = total_goals - line
+            status = "push" if abs(value) < 1e-9 else ("win" if (value > 0) == (side == "over") else "lose")
+        elif market and market.startswith("handicap_"):
+            _, side, raw_line = market.split("_", 2)
+            line = float(raw_line)
+            margin = home_goals + line - away_goals if side == "1" else away_goals + line - home_goals
+            status = "push" if abs(margin) < 1e-9 else ("win" if margin > 0 else "lose")
+        elif market == "btts_yes":
+            status = "win" if home_goals > 0 and away_goals > 0 else "lose"
+        elif market == "btts_no":
+            status = "win" if home_goals == 0 or away_goals == 0 else "lose"
         else:
             status = "pending"
         settled.append({
@@ -1366,8 +1447,8 @@ def _express_settlement(record, res):
         overall = "not_posted"
     elif any(item["status"] == "lose" for item in settled):
         overall = "lose"
-    elif settled and all(item["status"] == "win" for item in settled):
-        overall = "win"
+    elif settled and all(item["status"] in ("win", "push") for item in settled):
+        overall = "push" if all(item["status"] == "push" for item in settled) else "win"
     else:
         overall = "pending"
     record["settlement"] = overall
@@ -1403,19 +1484,22 @@ def _daily_express_result_block(history, res, today):
     out = [f"📊 <b>Результат экспресса за {e(dlabel(title_date))}</b>"]
     for item in settled:
         leg = item["leg"]
-        icon = "✅" if item["status"] == "win" else ("❌" if item["status"] == "lose" else "⏳")
+        icon = "✅" if item["status"] == "win" else ("❌" if item["status"] == "lose" else ("↩️" if item["status"] == "push" else "⏳"))
         score = f" · {e(item['score'])}" if item["score"] else " · результат ожидается"
         out.append(
             f"{icon} {e(leg.get('home'))} — {e(leg.get('away'))}{score}; "
             f"{e(leg.get('pick'))} · кф {('≈' if leg.get('estimated') else '')}{float(leg.get('odd') or 0):.2f}"
         )
     if overall == "win":
-        payout = round(1000 * total)
-        out.append(f"<b>Экспресс прошёл · кф {approx}{total:.2f} · при ставке 1 000 ₽ выплата ≈{payout:,} ₽, чистый результат +{payout - 1000:,} ₽.</b>".replace(",", " "))
+        effective_total = math.prod(float(item["leg"].get("odd") or 1) for item in settled if item["status"] == "win")
+        payout = round(1000 * effective_total)
+        out.append(f"<b>Экспресс прошёл · расчётный кф {effective_total:.2f} · при ставке 1 000 ₽ выплата ≈{payout:,} ₽, чистый результат +{payout - 1000:,} ₽.</b>".replace(",", " "))
+    elif overall == "push":
+        out.append("<b>Возврат по экспрессу: все события рассчитаны как возврат.</b>")
     elif overall == "lose":
         out.append("<b>Экспресс не прошёл · при ставке 1 000 ₽ выплата 0 ₽, результат −1 000 ₽.</b>")
     else:
-        completed = sum(item["status"] in ("win", "lose") for item in settled)
+        completed = sum(item["status"] in ("win", "lose", "push") for item in settled)
         out.append(f"<b>Пока рассчитано {completed} из {len(settled)} событий; полный итог появится после завершения всех матчей.</b>")
     return "\n".join(out)
 
