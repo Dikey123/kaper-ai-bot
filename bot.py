@@ -25,6 +25,9 @@ from aiogram.client.default import DefaultBotProperties
 
 # Источник данных — наш публичный сайт
 BASE = os.environ.get("DATA_BASE", "https://dikey123.github.io/football-prognozy/")
+# Адрес страницы приложения: отдаём её с самого бота (/app), чтобы не зависеть от публичного GitHub Pages.
+_rext = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+APP_URL = os.environ.get("APP_URL", "").strip() or ((_rext + "/app") if _rext else BASE)
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задан BOT_TOKEN (переменная окружения).")
@@ -96,6 +99,18 @@ async def db_get_snapshot(key):
             return json.loads(row["payload"])
     except Exception as ex:
         print("DB get error:", ex)
+    return None
+
+async def db_get_text(key):
+    if not _pool:
+        return None
+    try:
+        async with _pool.acquire() as c:
+            row = await c.fetchrow("SELECT payload FROM snapshots WHERE key=$1", key)
+        if row and row["payload"]:
+            return row["payload"]
+    except Exception as ex:
+        print("DB text error:", ex)
     return None
 
 async def db_touch_user(user):
@@ -258,7 +273,7 @@ def date_button_label(day, today, count):
 # ---------- экранчики ----------
 def main_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=BASE))
+    kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=APP_URL))
     kb.button(text="⚽ Матчи по датам", callback_data="today")
     kb.button(text="🏆 Рейтинг", callback_data="rating")
     kb.button(text="⚡ Экспресс дня", callback_data="express")
@@ -781,7 +796,7 @@ async def set_user_menu(bot, uid, allow):
     if _menu_state.get(uid) == allow:
         return
     try:
-        btn = (MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE))
+        btn = (MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=APP_URL))
                if allow else MenuButtonDefault())
         await bot.set_chat_menu_button(chat_id=uid, menu_button=btn)
         _menu_state[uid] = allow
@@ -838,7 +853,7 @@ async def start(msg: Message):
 @dp.message(Command("app"))
 async def cmd_app(msg: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=BASE))
+    kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=APP_URL))
     await msg.answer("Открыть «Капер ИИ» как приложение — на весь экран:", reply_markup=kb.as_markup())
 
 @dp.message(Command("today", "matches"))
@@ -969,6 +984,22 @@ async def _status(request):
         "db": st,
     }, headers=CORS)
 
+async def _app(request):
+    """Страница Mini App: отдаём из базы; если там нет — на время перехода проксируем с сайта."""
+    page = await db_get_text("page")
+    if not page:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(BASE + "index.html", timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        page = await r.text()
+        except Exception as ex:
+            print("app proxy error:", ex)
+    if not page:
+        return web.Response(text="Приложение временно недоступно, попробуйте позже.", status=503)
+    return web.Response(text=page, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-store"})
+
 async def api_data(request):
     uid = check_init_data(request.query.get("initData", ""), TOKEN)
     if not uid:
@@ -992,6 +1023,7 @@ async def start_web(bot):
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
     app.router.add_get("/status", _status)
+    app.router.add_get("/app", _app)
     app.router.add_get("/api/data", api_data)
     app.router.add_options("/api/data", api_options)
     runner = web.AppRunner(app)
@@ -1506,7 +1538,7 @@ async def main():
             await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
         else:
             await bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=BASE)))
+                menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=APP_URL)))
     except Exception as ex:
         print("Не удалось задать кнопку-меню:", ex)
     global BOT_USERNAME
