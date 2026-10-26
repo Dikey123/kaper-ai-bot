@@ -1838,7 +1838,8 @@ def _pick_kb(m, user_pick):
         b.button(text=("✅ " if user_pick == code else "") + lbl, callback_data=f"iq:{h}:{code}")
     b.button(text="Пропустить ⏭", callback_data=f"iqs:{h}")
     b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
-    b.adjust(3, 1, 1)
+    b.button(text="⬅️ В меню", callback_data="menu")
+    b.adjust(3, 1, 1, 1)
     return b.as_markup()
 
 def _match_prompt(m, idx, total):
@@ -1865,7 +1866,7 @@ async def _show_next(target, user_id, edit=False):
     picked = await db_picked_keys(user_id)
     remaining = [m for m in up if _mkey(m) not in picked]
     if not remaining:
-        b = InlineKeyboardBuilder(); b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
+        b = InlineKeyboardBuilder(); b.button(text="🏆 Таблица лидеров", callback_data="iqtop"); b.button(text="⬅️ В меню", callback_data="menu")
         return await _send(target, edit,
             "🎉 Ты сделал прогнозы на все ближайшие матчи!\nРезультаты придут после игр. Посмотри, как идёшь против ИИ 👇",
             b.as_markup())
@@ -1906,7 +1907,7 @@ async def cmd_play(msg: Message):
 async def cmd_top(msg: Message):
     await db_touch_user(msg.from_user)
     _, res = await get_data()
-    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay")
+    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="⬅️ В меню", callback_data="menu")
     await msg.answer(await _leaderboard_text(msg.from_user.id, res), reply_markup=b.as_markup(), disable_web_page_preview=True)
 
 @dp.callback_query(F.data.startswith("iq:"))
@@ -1949,7 +1950,7 @@ async def cb_iqplay(c: CallbackQuery):
 async def cb_iqtop(c: CallbackQuery):
     await c.answer()
     _, res = await get_data()
-    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay")
+    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="⬅️ В меню", callback_data="menu")
     await _send(c.message, True, await _leaderboard_text(c.from_user.id, res), b.as_markup())
 
 
