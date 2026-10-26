@@ -769,6 +769,14 @@ def express(data, n=3, res=None, today=None):
             if pick and price:
                 add_option(pick, price, support=1)
 
+        # Общие котировки 1X2 используются только внутри подбора;
+        # в карточке матча список букмекеров и их таблица не показываются.
+        raw_odds = match.get("odds") or []
+        for index, pick in enumerate(("П1", "Х", "П2")):
+            price = _valid_decimal(raw_odds[index] if index < len(raw_odds) else None)
+            if price:
+                add_option(pick, price)
+
         for opinion in (match.get("ai") or {}, match.get("gpt") or {}):
             if not ai_bet_eligible(opinion):
                 continue
