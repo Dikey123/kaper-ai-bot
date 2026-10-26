@@ -83,6 +83,9 @@ async def db_init():
                     result text,
                     UNIQUE(user_id, match_key)
                 );
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS points integer;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS beat_ai boolean;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS settled_at timestamptz;
             """)
         print("DB: подключено, схема готова.")
     except Exception as ex:
@@ -274,10 +277,11 @@ def date_button_label(day, today, count):
 def main_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🟢 Открыть приложение", web_app=WebAppInfo(url=APP_URL))
+    kb.button(text="🎮 Обыграй ИИ", callback_data="iqplay")
     kb.button(text="⚽ Матчи по датам", callback_data="today")
     kb.button(text="🏆 Рейтинг", callback_data="rating")
     kb.button(text="⚡ Экспресс дня", callback_data="express")
-    kb.adjust(1, 1, 2)
+    kb.adjust(1, 1, 1, 2)
     return kb.as_markup()
 
 async def screen_today(data, res=None, selected=None):
@@ -1642,6 +1646,313 @@ async def cmd_post(msg: Message):
     ok = await post_daily(msg.bot)
     await msg.answer("Пост отправлен в канал ✅" if ok else "Сегодня нет матчей — пост не отправлен.")
 
+# ================= Обыграй ИИ (прогнозы пользователей против ИИ) =================
+import hashlib as _hl
+MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
+PICK_LABEL = {"1": "П1", "X": "Х", "2": "П2"}
+
+def _mkey(m):
+    return f"{m.get('date','')}|{m.get('home','')}|{m.get('away','')}"
+
+def _mhash(key):
+    return _hl.md5(key.encode("utf-8")).hexdigest()[:12]
+
+def _outcome_from_score(s):
+    mm = re.match(r"\s*(\d+)\D+(\d+)", str(s or ""))
+    if not mm:
+        return None
+    h, a = int(mm.group(1)), int(mm.group(2))
+    return "1" if h > a else ("2" if a > h else "X")
+
+def _ai_outcome(m):
+    for k in ("ai", "gpt"):
+        op = m.get(k) or {}
+        o = _outcome_from_score(op.get("score"))
+        if o:
+            return o
+        pk = str(op.get("pick") or op.get("bet") or "")
+        if "П1" in pk:
+            return "1"
+        if "П2" in pk:
+            return "2"
+        if pk.strip() in ("Х", "X"):
+            return "X"
+    return None
+
+def _kickoff(m):
+    try:
+        return datetime.datetime.strptime(
+            (m.get("date", "") + " " + (m.get("time") or "00:00")), "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=MSK_TZ)
+    except Exception:
+        return None
+
+def _upcoming(data):
+    now = datetime.datetime.now(MSK_TZ)
+    out = []
+    for t, i, m in all_matches(data):
+        if m.get("ft"):
+            continue
+        k = _kickoff(m)
+        if not k or k <= now:
+            continue
+        out.append((k, m))
+    out.sort(key=lambda x: x[0])
+    return [m for _, m in out]
+
+def _week_start_iso():
+    now = datetime.datetime.now(MSK_TZ)
+    monday = (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return monday.isoformat()
+
+async def db_save_pick(user, match_key, pick):
+    if not _pool or user is None:
+        return
+    try:
+        async with _pool.acquire() as c:
+            await c.execute(
+                """INSERT INTO picks(user_id, match_key, pick, result) VALUES($1,$2,$3,'pending')
+                   ON CONFLICT(user_id, match_key) DO UPDATE
+                     SET pick=EXCLUDED.pick, result='pending', points=NULL, beat_ai=NULL, settled_at=NULL
+                   WHERE picks.result='pending' OR picks.result IS NULL""",
+                user.id, match_key, pick)
+    except Exception as ex:
+        print("db_save_pick:", ex)
+
+async def db_user_pick(user_id, match_key):
+    if not _pool:
+        return None
+    try:
+        async with _pool.acquire() as c:
+            return await c.fetchval("SELECT pick FROM picks WHERE user_id=$1 AND match_key=$2", user_id, match_key)
+    except Exception:
+        return None
+
+async def db_picked_keys(user_id):
+    if not _pool:
+        return set()
+    try:
+        async with _pool.acquire() as c:
+            rows = await c.fetch("SELECT match_key FROM picks WHERE user_id=$1", user_id)
+        return {r["match_key"] for r in rows}
+    except Exception:
+        return set()
+
+async def db_settle_match(match_key, outcome, ai_correct):
+    if not _pool:
+        return
+    try:
+        async with _pool.acquire() as c:
+            await c.execute(
+                """UPDATE picks SET
+                     result = CASE WHEN pick=$2 THEN 'win' ELSE 'lose' END,
+                     points = CASE WHEN pick=$2 THEN (CASE WHEN $3 THEN 10 ELSE 15 END) ELSE 0 END,
+                     beat_ai = (pick=$2 AND NOT $3),
+                     settled_at = now()
+                   WHERE match_key=$1 AND pick IN ('1','X','2') AND (result='pending' OR result IS NULL)""",
+                match_key, outcome, bool(ai_correct))
+    except Exception as ex:
+        print("db_settle_match:", ex)
+
+async def db_leaderboard(limit=10):
+    if not _pool:
+        return []
+    try:
+        async with _pool.acquire() as c:
+            rows = await c.fetch(
+                """SELECT p.user_id, COALESCE(u.username, u.first_name, 'Игрок') AS name,
+                      SUM(COALESCE(p.points,0)) AS pts,
+                      COUNT(*) FILTER (WHERE p.result='win') AS wins,
+                      COUNT(*) FILTER (WHERE p.result IN ('win','lose')) AS total,
+                      COUNT(*) FILTER (WHERE p.beat_ai) AS beat
+                   FROM picks p LEFT JOIN users u ON u.user_id = p.user_id
+                   WHERE p.settled_at >= $1
+                   GROUP BY p.user_id, u.username, u.first_name
+                   HAVING COUNT(*) FILTER (WHERE p.result IN ('win','lose')) > 0
+                   ORDER BY pts DESC, wins DESC LIMIT $2""",
+                _week_start_iso(), limit)
+        return [dict(r) for r in rows]
+    except Exception as ex:
+        print("db_leaderboard:", ex)
+        return []
+
+async def db_user_week(user_id):
+    if not _pool:
+        return None
+    try:
+        ws = _week_start_iso()
+        async with _pool.acquire() as c:
+            r = await c.fetchrow(
+                """SELECT SUM(COALESCE(points,0)) AS pts,
+                      COUNT(*) FILTER (WHERE result='win') AS wins,
+                      COUNT(*) FILTER (WHERE result IN ('win','lose')) AS total,
+                      COUNT(*) FILTER (WHERE beat_ai) AS beat,
+                      COUNT(*) FILTER (WHERE (result='pending' OR result IS NULL) AND pick IN ('1','X','2')) AS pending
+                   FROM picks WHERE user_id=$1 AND (settled_at >= $2 OR result='pending' OR result IS NULL)""",
+                user_id, ws)
+            rank = await c.fetchval(
+                """WITH lb AS (SELECT user_id, SUM(COALESCE(points,0)) pts FROM picks WHERE settled_at>=$2 GROUP BY user_id)
+                   SELECT COUNT(*)+1 FROM lb WHERE pts > COALESCE(
+                     (SELECT SUM(COALESCE(points,0)) FROM picks WHERE user_id=$1 AND settled_at>=$2), 0)""",
+                user_id, ws)
+        return dict(r, rank=rank) if r else None
+    except Exception as ex:
+        print("db_user_week:", ex)
+        return None
+
+def ai_week_record(res):
+    if not res:
+        return (0, 0)
+    start = _week_start_iso()[:10]
+    w = t = 0
+    for r in (res.get("recent") or []):
+        if str(r.get("date", "")) >= start and r.get("ai") in ("win", "lose"):
+            t += 1
+            w += (r.get("ai") == "win")
+    return w, t
+
+async def settle_user_picks():
+    data, _ = await get_data()
+    if not data:
+        return
+    for t, i, m in all_matches(data):
+        oc = _outcome_from_score(m.get("ft"))
+        if not oc:
+            continue
+        await db_settle_match(_mkey(m), oc, _ai_outcome(m) == oc)
+
+async def settle_loop(bot):
+    if not DATABASE_URL:
+        return
+    while True:
+        try:
+            await settle_user_picks()
+        except Exception as ex:
+            print("settle_loop:", ex)
+        await asyncio.sleep(1800)  # каждые 30 минут
+
+def _pick_kb(m, user_pick):
+    h = _mhash(_mkey(m))
+    b = InlineKeyboardBuilder()
+    for code, lbl in (("1", "П1 (хоз.)"), ("X", "Ничья"), ("2", "П2 (гости)")):
+        b.button(text=("✅ " if user_pick == code else "") + lbl, callback_data=f"iq:{h}:{code}")
+    b.button(text="Пропустить ⏭", callback_data=f"iqs:{h}")
+    b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
+    b.adjust(3, 1, 1)
+    return b.as_markup()
+
+def _match_prompt(m, idx, total):
+    k = _kickoff(m)
+    tm = k.strftime("%d.%m в %H:%M") if k else (m.get("time") or "")
+    return (f"🎮 <b>Обыграй ИИ</b> · матч {idx} из {total}\n\n"
+            f"<b>{e(m.get('home'))} — {e(m.get('away'))}</b>\n🗓 {e(tm)} МСК\n\n"
+            f"Как сыграют? Выбери исход — после матча сравним с прогнозом ИИ.")
+
+async def _send(target, edit, text, kb=None):
+    try:
+        if edit:
+            await target.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        else:
+            await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
+    except Exception as ex:
+        print("_send:", ex)
+
+async def _show_next(target, user_id, edit=False):
+    data, _ = await get_data()
+    up = _upcoming(data)
+    if not up:
+        return await _send(target, edit, "Сейчас нет предстоящих матчей для прогноза — загляни позже 🙌")
+    picked = await db_picked_keys(user_id)
+    remaining = [m for m in up if _mkey(m) not in picked]
+    if not remaining:
+        b = InlineKeyboardBuilder(); b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
+        return await _send(target, edit,
+            "🎉 Ты сделал прогнозы на все ближайшие матчи!\nРезультаты придут после игр. Посмотри, как идёшь против ИИ 👇",
+            b.as_markup())
+    m = remaining[0]
+    idx = len(up) - len(remaining) + 1
+    up_pick = await db_user_pick(user_id, _mkey(m))
+    await _send(target, edit, _match_prompt(m, idx, len(up)), _pick_kb(m, up_pick))
+
+async def _leaderboard_text(user_id, res):
+    lb = await db_leaderboard(10)
+    me = await db_user_week(user_id)
+    aw, at = ai_week_record(res)
+    out = ["🏆 <b>Обыграй ИИ — таблица недели</b>", ""]
+    if lb:
+        medals = ["🥇", "🥈", "🥉"]
+        for i, row in enumerate(lb):
+            pos = medals[i] if i < 3 else f"{i+1}."
+            out.append(f"{pos} {e(row['name'])} — <b>{row['pts']}</b> очк. "
+                       f"({row['wins']}/{row['total']}, обыграл ИИ {row['beat']}×)")
+    else:
+        out.append("Пока никто не сыграл за эту неделю. Будь первым — сделай прогноз!")
+    out.append("")
+    out.append(f"🤖 <b>ИИ</b> на этой неделе: угадал <b>{aw}</b> из {at}")
+    if me and ((me.get("total") or 0) or (me.get("pending") or 0)):
+        out.append("")
+        out.append(f"👤 <b>Ты</b>: {me.get('pts') or 0} очк. · место {me.get('rank')} · "
+                   f"угадал {me.get('wins') or 0}/{me.get('total') or 0} · "
+                   f"обыграл ИИ {me.get('beat') or 0}× · ждут результата {me.get('pending') or 0}")
+    out.append("\n<i>+10 очков за угаданный исход, +15 если при этом обыграл ИИ. 18+</i>")
+    return "\n".join(out)
+
+@dp.message(Command("play"))
+async def cmd_play(msg: Message):
+    await db_touch_user(msg.from_user)
+    await _show_next(msg, msg.from_user.id, edit=False)
+
+@dp.message(Command("top"))
+async def cmd_top(msg: Message):
+    await db_touch_user(msg.from_user)
+    _, res = await get_data()
+    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay")
+    await msg.answer(await _leaderboard_text(msg.from_user.id, res), reply_markup=b.as_markup(), disable_web_page_preview=True)
+
+@dp.callback_query(F.data.startswith("iq:"))
+async def cb_iq(c: CallbackQuery):
+    parts = c.data.split(":", 2)
+    if len(parts) != 3:
+        return await c.answer()
+    h, code = parts[1], parts[2]
+    data, _ = await get_data()
+    m = next((mm for t, i, mm in all_matches(data) if _mhash(_mkey(mm)) == h), None)
+    if not m:
+        await c.answer("Матч не найден", show_alert=False)
+        return await _show_next(c.message, c.from_user.id, edit=True)
+    k = _kickoff(m)
+    if m.get("ft") or (k and k <= datetime.datetime.now(MSK_TZ)):
+        await c.answer("Матч уже начался — прогноз не принят", show_alert=True)
+    else:
+        await db_touch_user(c.from_user)
+        await db_save_pick(c.from_user, _mkey(m), code)
+        await c.answer(f"Принято: {PICK_LABEL.get(code, code)} ✅")
+    await _show_next(c.message, c.from_user.id, edit=True)
+
+@dp.callback_query(F.data.startswith("iqs:"))
+async def cb_iqskip(c: CallbackQuery):
+    parts = c.data.split(":", 1)
+    if len(parts) == 2:
+        data, _ = await get_data()
+        m = next((mm for t, i, mm in all_matches(data) if _mhash(_mkey(mm)) == parts[1]), None)
+        if m:
+            await db_save_pick(c.from_user, _mkey(m), "skip")
+    await c.answer("Пропущено")
+    await _show_next(c.message, c.from_user.id, edit=True)
+
+@dp.callback_query(F.data == "iqplay")
+async def cb_iqplay(c: CallbackQuery):
+    await c.answer()
+    await _show_next(c.message, c.from_user.id, edit=True)
+
+@dp.callback_query(F.data == "iqtop")
+async def cb_iqtop(c: CallbackQuery):
+    await c.answer()
+    _, res = await get_data()
+    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay")
+    await _send(c.message, True, await _leaderboard_text(c.from_user.id, res), b.as_markup())
+
+
 async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await db_init()
@@ -1652,6 +1963,8 @@ async def main():
         BotCommand(command="today", description="Матчи и результаты по датам"),
         BotCommand(command="rating", description="Рейтинг прогнозистов"),
         BotCommand(command="express", description="Экспресс дня"),
+        BotCommand(command="play", description="🎮 Обыграй ИИ — сделать прогноз"),
+        BotCommand(command="top", description="🏆 Таблица лидеров «Обыграй ИИ»"),
     ])
     try:
         if REQUIRED_CHAT:
@@ -1670,6 +1983,7 @@ async def main():
         print("get_me:", ex)
     await start_web(bot)
     asyncio.create_task(channel_poster(bot))
+    asyncio.create_task(settle_loop(bot))
     print("Бот запущен (polling)…")
     await dp.start_polling(bot)
 
