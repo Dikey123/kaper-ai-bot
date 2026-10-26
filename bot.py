@@ -27,7 +27,7 @@ from aiogram.client.default import DefaultBotProperties
 BASE = os.environ.get("DATA_BASE", "https://dikey123.github.io/football-prognozy/")
 # Адрес страницы приложения: отдаём её с самого бота (/app), чтобы не зависеть от публичного GitHub Pages.
 _rext = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-APP_URL = os.environ.get("APP_URL", "").strip() or ((_rext + "/app") if _rext else BASE)
+APP_URL = (_rext + "/app") if _rext else (os.environ.get("APP_URL", "").strip() or BASE)
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задан BOT_TOKEN (переменная окружения).")
