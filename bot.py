@@ -86,6 +86,10 @@ async def db_init():
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS points integer;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS beat_ai boolean;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS settled_at timestamptz;
+                CREATE TABLE IF NOT EXISTS notifications(
+                    key text PRIMARY KEY,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                );
             """)
         print("DB: подключено, схема готова.")
     except Exception as ex:
@@ -1954,6 +1958,201 @@ async def cb_iqtop(c: CallbackQuery):
     await _send(c.message, True, await _leaderboard_text(c.from_user.id, res), b.as_markup())
 
 
+# ================= Уведомления (рассылка всем пользователям) =================
+# Три типа: утренний прогноз дня, напоминание за час до матча, итог после матча.
+# Дедупликация — через таблицу notifications (INSERT ... ON CONFLICT DO NOTHING RETURNING).
+
+NOTIFY_INTERVAL = 150          # период проверки петли, сек (~2.5 мин)
+NOTIFY_SEND_PAUSE = 0.06       # пауза между отправками при рассылке, сек
+NOTIFY_MORNING_HOUR = 10       # час МСК для утреннего прогноза дня
+NOTIFY_PRE_MIN = 55            # нижняя граница окна «за час до матча», мин
+NOTIFY_PRE_MAX = 65            # верхняя граница окна «за час до матча», мин
+NOTIFY_RESULT_MIN_AGE = 90     # матч попадает в «итоги», если стартовал не раньше, мин
+NOTIFY_RESULT_MAX_AGE = 300    # ...и не позже, мин (защита от рассылки старых результатов при старте)
+
+
+async def _notify_claim(key):
+    """Пытается застолбить ключ уведомления. True = можно слать (строка вставлена),
+    False = уже слали раньше либо база недоступна."""
+    if not _pool:
+        return False
+    try:
+        async with _pool.acquire() as c:
+            row = await c.fetchrow(
+                "INSERT INTO notifications(key) VALUES($1) ON CONFLICT (key) DO NOTHING RETURNING key",
+                key)
+        return row is not None
+    except Exception as ex:
+        print("notify_claim:", ex)
+        return False
+
+
+async def _notify_all_users(bot, text):
+    """Рассылка текста всем пользователям из таблицы users.
+    Длинный текст режется на части; каждая отправка защищена try/except."""
+    if not _pool:
+        return 0
+    try:
+        async with _pool.acquire() as c:
+            rows = await c.fetch("SELECT user_id FROM users")
+    except Exception as ex:
+        print("notify fetch users:", ex)
+        return 0
+    chunks = _split_telegram_text(text)
+    sent = 0
+    for r in rows:
+        uid = r["user_id"]
+        try:
+            for chunk in chunks:
+                await bot.send_message(uid, chunk, disable_web_page_preview=True)
+            sent += 1
+        except Exception:
+            # пользователь мог заблокировать бота или удалить чат — пропускаем, не падаем
+            pass
+        await asyncio.sleep(NOTIFY_SEND_PAUSE)
+    return sent
+
+
+def _notify_lineups(m):
+    """Короткий блок предполагаемого состава (переиспользует screen_lineups)."""
+    try:
+        if m.get("lineups"):
+            return screen_lineups(m)
+    except Exception as ex:
+        print("notify_lineups:", ex)
+    return ""
+
+
+async def _notify_morning(bot):
+    """Раз в день около NOTIFY_MORNING_HOUR:00 МСК — «Прогноз дня готов» + лучший прогноз."""
+    now = datetime.datetime.now(MSK_TZ)
+    if now.hour != NOTIFY_MORNING_HOUR:
+        return
+    today = now.date().isoformat()
+    data, res = await get_data()
+    if not data:
+        return  # нет данных — попробуем в следующем проходе, ключ не тратим
+    candidates = _daily_model_candidates(data, res, today)
+    if candidates:
+        best = candidates[0]
+        price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
+        meta = (f" · {e(best['time'])} МСК" if best.get("time") else "")
+        text = (
+            "🎯 <b>Прогноз дня готов</b>\n\n"
+            f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}{meta}\n"
+            f"Выбор ИИ: <b>{e(best['bet'])}</b> — кф <b>{price}</b>\n\n"
+            "Все матчи и прогнозы — в приложении. 18+"
+        )
+    else:
+        text = (
+            "🎯 <b>Прогноз дня готов</b>\n\n"
+            "Сегодня нет уверенного прогноза с проверяемым коэффициентом — "
+            "загляните в приложение за полным списком матчей. 18+"
+        )
+    if await _notify_claim(f"morning|{today}"):
+        n = await _notify_all_users(bot, text)
+        print(f"notify morning: разослано {n} ({today})")
+
+
+async def _notify_prematch(bot):
+    """За ~час до старта: матчи с началом через NOTIFY_PRE_MIN..NOTIFY_PRE_MAX минут.
+    Матчи на одно время — одним сообщением."""
+    data, _ = await get_data()
+    if not data:
+        return
+    now = datetime.datetime.now(MSK_TZ)
+    groups = {}  # (date, time) -> [matches]
+    for t, i, m in all_matches(data):
+        if m.get("ft"):
+            continue
+        k = _kickoff(m)
+        if not k:
+            continue
+        delta_min = (k - now).total_seconds() / 60.0
+        if NOTIFY_PRE_MIN <= delta_min <= NOTIFY_PRE_MAX:
+            groups.setdefault((m.get("date", ""), m.get("time", "")), []).append(m)
+    for (date, tm), matches in groups.items():
+        if not await _notify_claim(f"pre|{date}|{tm}"):
+            continue
+        if len(matches) == 1:
+            m = matches[0]
+            out = [f"⏰ <b>Скоро: {e(m.get('home'))} — {e(m.get('away'))} в {e(tm)} МСК</b>"]
+            ai = _ai_outcome(m)
+            if ai:
+                out.append(f"Выбор ИИ: <b>{PICK_LABEL.get(ai, ai)}</b>")
+            lu = _notify_lineups(m)
+            if lu:
+                out.append("\n" + lu)
+            out.append("\n18+")
+        else:
+            out = [f"⏰ <b>Скоро матчи в {e(tm)} МСК</b>\n"]
+            for m in matches:
+                line = f"• <b>{e(m.get('home'))} — {e(m.get('away'))}</b>"
+                ai = _ai_outcome(m)
+                if ai:
+                    line += f" · выбор ИИ: <b>{PICK_LABEL.get(ai, ai)}</b>"
+                out.append(line)
+            out.append("\n<i>Составы — в карточке матча в приложении.</i>\n18+")
+        n = await _notify_all_users(bot, "\n".join(out))
+        print(f"notify pre: {date} {tm}, матчей {len(matches)}, разослано {n}")
+
+
+async def _notify_results(bot):
+    """После матча (появился ft) — «ИИ угадал / не зашло». Завершившиеся на одно
+    время старта группируются в одно сообщение. Окно по возрасту старта защищает
+    от рассылки старых результатов при первом запуске."""
+    data, _ = await get_data()
+    if not data:
+        return
+    now = datetime.datetime.now(MSK_TZ)
+    groups = {}  # (date, time) -> [matches], только свежезавершившиеся и ещё не разосланные
+    for t, i, m in all_matches(data):
+        ft = m.get("ft")
+        if not ft or not _outcome_from_score(ft):
+            continue
+        k = _kickoff(m)
+        if not k:
+            continue
+        age_min = (now - k).total_seconds() / 60.0
+        if not (NOTIFY_RESULT_MIN_AGE <= age_min <= NOTIFY_RESULT_MAX_AGE):
+            continue
+        if not await _notify_claim(f"res|{_mkey(m)}"):
+            continue
+        groups.setdefault((m.get("date", ""), m.get("time", "")), []).append(m)
+    for _, matches in groups.items():
+        out = []
+        if len(matches) > 1:
+            out.append("📣 <b>Итоги матчей</b>\n")
+        for m in matches:
+            ft = re.sub(r"\s*[-:]\s*", ":", str(m.get("ft"))).strip()
+            oc = _outcome_from_score(ft)
+            ai = _ai_outcome(m)
+            if ai and oc:
+                if ai == oc:
+                    head, tail = "✅ ИИ угадал", f" (прогноз ИИ {PICK_LABEL.get(ai, ai)})"
+                else:
+                    head, tail = "❌ Не зашло", f" (прогноз ИИ {PICK_LABEL.get(ai, ai)})"
+            else:
+                head, tail = "🏁 Итог", ""
+            out.append(f"{head}: <b>{e(m.get('home'))} {e(ft)} {e(m.get('away'))}</b>{tail}")
+        out.append("\n18+")
+        n = await _notify_all_users(bot, "\n".join(out))
+        print(f"notify result: матчей {len(matches)}, разослано {n}")
+
+
+async def notify_loop(bot):
+    """Фоновая петля уведомлений: проверяет три условия каждые ~NOTIFY_INTERVAL сек."""
+    if not DATABASE_URL:
+        return
+    while True:
+        for step in (_notify_morning, _notify_prematch, _notify_results):
+            try:
+                await step(bot)
+            except Exception as ex:
+                print(f"{step.__name__}:", ex)
+        await asyncio.sleep(NOTIFY_INTERVAL)
+
+
 async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await db_init()
@@ -1985,6 +2184,7 @@ async def main():
     await start_web(bot)
     asyncio.create_task(channel_poster(bot))
     asyncio.create_task(settle_loop(bot))
+    asyncio.create_task(notify_loop(bot))
     print("Бот запущен (polling)…")
     await dp.start_polling(bot)
 
