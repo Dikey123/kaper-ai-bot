@@ -41,6 +41,77 @@ def channel_link():
 
 _cache = {"t": 0, "data": None, "res": None}
 
+# ---------- база данных (Supabase Postgres); всё отказоустойчиво ----------
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_pool = None
+
+async def db_init():
+    """Подключение к базе и создание схемы. Любая ошибка → работаем без базы (от сайта)."""
+    global _pool
+    if not DATABASE_URL:
+        print("DB: DATABASE_URL не задан — источник данных: публичный сайт.")
+        return
+    try:
+        import ssl as _ssl, asyncpg
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        _pool = await asyncpg.create_pool(DATABASE_URL, ssl=ctx, min_size=1, max_size=3, command_timeout=20)
+        async with _pool.acquire() as c:
+            await c.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots(
+                    key text PRIMARY KEY,
+                    payload text NOT NULL,
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                );
+                CREATE TABLE IF NOT EXISTS users(
+                    user_id bigint PRIMARY KEY,
+                    username text,
+                    first_name text,
+                    first_seen timestamptz NOT NULL DEFAULT now(),
+                    last_seen timestamptz NOT NULL DEFAULT now()
+                );
+                CREATE TABLE IF NOT EXISTS picks(
+                    id bigserial PRIMARY KEY,
+                    user_id bigint NOT NULL,
+                    match_key text NOT NULL,
+                    pick text NOT NULL,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    result text,
+                    UNIQUE(user_id, match_key)
+                );
+            """)
+        print("DB: подключено, схема готова.")
+    except Exception as ex:
+        print("DB init error (работаем без базы):", ex)
+        _pool = None
+
+async def db_get_snapshot(key):
+    if not _pool:
+        return None
+    try:
+        async with _pool.acquire() as c:
+            row = await c.fetchrow("SELECT payload FROM snapshots WHERE key=$1", key)
+        if row and row["payload"]:
+            return json.loads(row["payload"])
+    except Exception as ex:
+        print("DB get error:", ex)
+    return None
+
+async def db_touch_user(user):
+    if not _pool or user is None:
+        return
+    try:
+        async with _pool.acquire() as c:
+            await c.execute(
+                """INSERT INTO users(user_id, username, first_name, last_seen)
+                   VALUES($1,$2,$3, now())
+                   ON CONFLICT(user_id) DO UPDATE
+                   SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_seen=now()""",
+                user.id, getattr(user, "username", None), getattr(user, "first_name", None))
+    except Exception as ex:
+        print("DB user error:", ex)
+
 MON = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
 DAYS = ["воскресенье","понедельник","вторник","среда","четверг","пятница","суббота"]
 
@@ -108,10 +179,15 @@ async def get_data(force=False):
     now = time.time()
     if not force and _cache["data"] and now - _cache["t"] < 300:
         return _cache["data"], _cache["res"]
-    async with aiohttp.ClientSession() as s:
-        data = await fetch_json(s, BASE + "data.json")
-        res  = await fetch_json(s, BASE + "results.json")
-        gpt  = await fetch_json(s, BASE + "gpt.json")
+    # Сначала закрытая база; если там пусто/недоступно — публичный сайт (переходный период).
+    data = await db_get_snapshot("data")
+    res  = await db_get_snapshot("results")
+    gpt  = await db_get_snapshot("gpt")
+    if not data:
+        async with aiohttp.ClientSession() as s:
+            data = await fetch_json(s, BASE + "data.json")
+            res  = await fetch_json(s, BASE + "results.json")
+            gpt  = await fetch_json(s, BASE + "gpt.json")
     if data:
         merge_gpt(data, gpt)
         _cache.update(t=now, data=data, res=res)
@@ -734,6 +810,7 @@ dp.callback_query.outer_middleware(SubGate())
 
 @dp.message(CommandStart())
 async def start(msg: Message):
+    await db_touch_user(msg.from_user)
     await msg.answer(
         "👋 Привет! Это <b>Капер ИИ</b> — прогнозы на футбол: Лига чемпионов, Лига Европы и топ-5 лиг.\n\n"
         "• Матчи за 2 дня назад — 4 дня вперёд, с результатами сыгранных\n"
@@ -1389,6 +1466,7 @@ async def cmd_post(msg: Message):
 
 async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await db_init()
     await bot.set_my_commands([
         BotCommand(command="start", description="Меню"),
         BotCommand(command="app", description="Открыть приложение"),
