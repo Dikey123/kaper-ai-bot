@@ -503,7 +503,7 @@ def screen_rating(res, page=0):
         page = 0
     first = page * page_size
     last = min(first + page_size, len(rows))
-    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всех строк: {len(rows)} · страница {page+1}/{total_pages}. Текущую статистику ИИ и архив ≥75% показываем отдельно.</i>\n"]
+    out = [f"🏆 <b>Рейтинг прогнозистов</b>\n<i>% по {res.get('matches',0)} сыгранным матчам; всех строк: {len(rows)} · страница {page+1}/{total_pages}</i>\n"]
     for i, r in enumerate(rows[first:last], first + 1):
         tag = "" if r.get("ai") else (" 🇷🇺" if r["reg"] == "ru" else " 🇪🇺")
         small = " · мало данных" if r["n"] < 3 else ""
@@ -511,7 +511,7 @@ def screen_rating(res, page=0):
         pct = f"{r['pct']}%" if r["n"] else "—"
         sample = f"{r['n']} ставок" if r["n"] else "нет рассчитанных ставок"
         out.append(f"{i}. <b>{e(r['src'])}</b>{tag} — <b>{pct}</b> ({r['win']}–{r['lose']} · {sample}{push}{small})")
-    out.append("\n<i>Возвраты не входят в процент; прошлые результаты не гарантируют будущие. 18+</i>")
+    out.append("\n<i>18+. Исторические результаты не гарантируют будущие.</i>")
     return "\n".join(out), rating_kb(page, total_pages)
 
 
@@ -1232,7 +1232,7 @@ def _daily_rating_block(res):
             details += ", мало данных"
         out.append(f"• <b>{e(label)}</b> — {pct} ({details})")
 
-    out.append("<i>Возвраты не входят в процент; текущая выборка ИИ хранится отдельно от архива ≥75%. 18+</i>")
+
     return "\n".join(out)
 
 
