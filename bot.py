@@ -1885,6 +1885,21 @@ async def db_user_week(user_id):
         print("db_user_week:", ex)
         return None
 
+async def db_my_picks(user_id, limit=20):
+    """Сырые прогнозы пользователя (для диагностики и команды /mypicks)."""
+    if not _pool:
+        return []
+    try:
+        async with _pool.acquire() as c:
+            rows = await c.fetch(
+                """SELECT match_key, pick, result, points, beat_ai, created_at, settled_at
+                   FROM picks WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2""",
+                user_id, limit)
+        return [dict(r) for r in rows]
+    except Exception as ex:
+        print("db_my_picks:", ex)
+        return []
+
 def ai_week_record(res):
     if not res:
         return (0, 0)
@@ -2014,6 +2029,29 @@ async def cmd_top(msg: Message):
     _, res = await get_data()
     b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="⬅️ В меню", callback_data="menu")
     await msg.answer(await _leaderboard_text(msg.from_user.id, res), reply_markup=b.as_markup(), disable_web_page_preview=True)
+
+@dp.message(Command("mypicks"))
+async def cmd_mypicks(msg: Message):
+    """Диагностика: показывает сохранённые прогнозы пользователя из базы."""
+    await db_touch_user(msg.from_user)
+    if not _pool:
+        return await msg.answer("База недоступна — прогнозы не сохраняются. Сообщи администратору.")
+    rows = await db_my_picks(msg.from_user.id)
+    actual = [r for r in rows if r["pick"] in ("1", "X", "2")]
+    if not actual:
+        return await msg.answer(
+            "У тебя пока нет сохранённых прогнозов в «Обыграй ИИ».\n"
+            "Открой «🎮 Сделать прогноз», выбери матч и нажми исход (П1 / Ничья / П2) — "
+            "после этого появишься в таблице недели.")
+    lines = [f"🎮 <b>Твои прогнозы</b> (всего {len(actual)}):"]
+    for r in actual[:15]:
+        parts = str(r["match_key"]).split("|")
+        teams = f"{parts[1]} — {parts[2]}" if len(parts) == 3 else r["match_key"]
+        pick = PICK_LABEL.get(r["pick"], r["pick"])
+        status = r["result"] or "ждёт результата"
+        pts = "" if r["points"] is None else f" · {r['points']} очк."
+        lines.append(f"• {e(teams)}: <b>{pick}</b> — {status}{pts}")
+    await msg.answer("\n".join(lines), disable_web_page_preview=True)
 
 @dp.callback_query(F.data.startswith("iq:"))
 async def cb_iq(c: CallbackQuery):
@@ -2231,6 +2269,7 @@ async def main():
         BotCommand(command="express", description="Экспресс дня"),
         BotCommand(command="play", description="🎮 Обыграй ИИ — сделать прогноз"),
         BotCommand(command="top", description="🏆 Таблица лидеров «Обыграй ИИ»"),
+        BotCommand(command="mypicks", description="📋 Мои прогнозы «Обыграй ИИ»"),
     ])
     try:
         if REQUIRED_CHAT:
