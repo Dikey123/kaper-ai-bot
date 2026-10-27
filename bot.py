@@ -1851,7 +1851,7 @@ async def db_leaderboard(limit=10):
                       COUNT(*) FILTER (WHERE p.result IN ('win','lose')) AS total,
                       COUNT(*) FILTER (WHERE p.beat_ai) AS beat
                    FROM picks p LEFT JOIN users u ON u.user_id = p.user_id
-                   WHERE p.settled_at >= $1
+                   WHERE p.settled_at >= $1::timestamptz
                    GROUP BY p.user_id, u.username, u.first_name
                    HAVING COUNT(*) FILTER (WHERE p.result IN ('win','lose')) > 0
                    ORDER BY pts DESC, wins DESC LIMIT $2""",
@@ -1873,12 +1873,12 @@ async def db_user_week(user_id):
                       COUNT(*) FILTER (WHERE result IN ('win','lose')) AS total,
                       COUNT(*) FILTER (WHERE beat_ai) AS beat,
                       COUNT(*) FILTER (WHERE (result='pending' OR result IS NULL) AND pick IN ('1','X','2')) AS pending
-                   FROM picks WHERE user_id=$1 AND (settled_at >= $2 OR result='pending' OR result IS NULL)""",
+                   FROM picks WHERE user_id=$1 AND (settled_at >= $2::timestamptz OR result='pending' OR result IS NULL)""",
                 user_id, ws)
             rank = await c.fetchval(
-                """WITH lb AS (SELECT user_id, SUM(COALESCE(points,0)) pts FROM picks WHERE settled_at>=$2 GROUP BY user_id)
+                """WITH lb AS (SELECT user_id, SUM(COALESCE(points,0)) pts FROM picks WHERE settled_at>=$2::timestamptz GROUP BY user_id)
                    SELECT COUNT(*)+1 FROM lb WHERE pts > COALESCE(
-                     (SELECT SUM(COALESCE(points,0)) FROM picks WHERE user_id=$1 AND settled_at>=$2), 0)""",
+                     (SELECT SUM(COALESCE(points,0)) FROM picks WHERE user_id=$1 AND settled_at>=$2::timestamptz), 0)""",
                 user_id, ws)
         return dict(r, rank=rank) if r else None
     except Exception as ex:
