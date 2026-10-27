@@ -90,6 +90,12 @@ async def db_init():
                     key text PRIMARY KEY,
                     created_at timestamptz NOT NULL DEFAULT now()
                 );
+                CREATE TABLE IF NOT EXISTS botkv(
+                    key text PRIMARY KEY,
+                    payload text NOT NULL,
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                );
+                DELETE FROM notifications WHERE created_at < now() - interval '30 days';
             """)
         print("DB: подключено, схема готова.")
     except Exception as ex:
@@ -119,6 +125,34 @@ async def db_get_text(key):
     except Exception as ex:
         print("DB text error:", ex)
     return None
+
+async def db_get_kv(key):
+    """Чтение собственного состояния бота из таблицы botkv (её НЕ трогает внешняя синхронизация)."""
+    if not _pool:
+        return None
+    try:
+        async with _pool.acquire() as c:
+            row = await c.fetchrow("SELECT payload FROM botkv WHERE key=$1", key)
+        if row and row["payload"]:
+            return row["payload"]
+    except Exception as ex:
+        print("db_get_kv:", ex)
+    return None
+
+async def db_set_kv(key, text):
+    """Запись собственного состояния бота в botkv. True = успешно."""
+    if not _pool:
+        return False
+    try:
+        async with _pool.acquire() as c:
+            await c.execute(
+                """INSERT INTO botkv(key, payload, updated_at) VALUES($1,$2, now())
+                   ON CONFLICT(key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=now()""",
+                key, text)
+        return True
+    except Exception as ex:
+        print("db_set_kv:", ex)
+        return False
 
 async def db_touch_user(user):
     if not _pool or user is None:
@@ -1390,7 +1424,18 @@ EXPRESS_HISTORY_FILE = os.environ.get(
 )
 
 
-def _load_express_history():
+async def _load_express_history():
+    # Основное хранилище — база (botkv), чтобы история переживала перезапуски Render
+    # (локальный диск там эфемерный). Файл остаётся запасным вариантом.
+    if _pool:
+        try:
+            txt = await db_get_kv("express_history")
+            if txt:
+                value = json.loads(txt)
+                if isinstance(value, dict) and isinstance(value.get("days"), list):
+                    return value
+        except Exception as ex:
+            print("express history load (db):", ex)
     try:
         with open(EXPRESS_HISTORY_FILE, encoding="utf-8") as f:
             value = json.load(f)
@@ -1535,7 +1580,7 @@ def _split_telegram_text(text, limit=3800):
     return chunks or [str(text)]
 
 
-def _save_express_history(history, today, legs):
+async def _save_express_history(history, today, legs):
     days = [item for item in history.get("days", []) if item.get("date") != today]
     record_legs = []
     total = 1.0
@@ -1563,6 +1608,9 @@ def _save_express_history(history, today, legs):
         "settlement": "pending" if record_legs else "not_posted",
     })
     history["days"] = sorted(days, key=lambda item: item.get("date", ""))[-30:]
+    # Основное хранилище — база (переживает перезапуски Render); файл — запасной.
+    if _pool and await db_set_kv("express_history", json.dumps(history, ensure_ascii=False)):
+        return
     directory = os.path.dirname(EXPRESS_HISTORY_FILE) or "."
     os.makedirs(directory, exist_ok=True)
     temp_path = EXPRESS_HISTORY_FILE + ".tmp"
@@ -1585,7 +1633,7 @@ async def post_daily(bot):
         ).date().isoformat()
     rows = [m for (t, i, m) in all_matches(data) if m.get("date") == today]
     express_legs = express(data, 3, res=res, today=today)
-    history = _load_express_history()
+    history = await _load_express_history()
     previous_result = _daily_express_result_block(history, res, today)
 
     parts = [
@@ -1612,7 +1660,7 @@ async def post_daily(bot):
             kwargs["reply_markup"] = kb.as_markup()
         await bot.send_message(REQUIRED_CHAT, chunk, **kwargs)
 
-    _save_express_history(history, today, express_legs)
+    await _save_express_history(history, today, express_legs)
     print(f"Ежедневный пост отправлен: {today}, матчей {len(rows)}, экспрессов {len(express_legs)} событий.")
     return True
 
@@ -1624,6 +1672,19 @@ async def channel_poster(bot):
     MSK = datetime.timezone(datetime.timedelta(hours=3))
     while True:
         now = datetime.datetime.now(MSK)
+        today = now.date().isoformat()
+        # Догоняющая публикация: если сегодняшнее время поста уже прошло (бот мог спать
+        # или перезапуститься после 13:30) и сегодня ещё не постили — публикуем сейчас.
+        # Дедуп по дате через notifications защищает от повторной публикации.
+        if any(now.replace(hour=h, minute=m, second=0, microsecond=0) <= now for h, m in POST_TIMES):
+            do_post = (await _notify_claim(f"daily|{today}")) if _pool else True
+            if do_post:
+                try:
+                    await post_daily(bot)
+                except Exception as ex:
+                    print("channel_poster:", ex)
+        # Спим до ближайшего будущего слота (сегодня позже или завтра).
+        now = datetime.datetime.now(MSK)
         cands = []
         for h, m in POST_TIMES:
             t = now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -1631,11 +1692,6 @@ async def channel_poster(bot):
                 t += datetime.timedelta(days=1)
             cands.append(t)
         await asyncio.sleep(max(30, (min(cands) - now).total_seconds()))
-        try:
-            await post_daily(bot)
-        except Exception as ex:
-            print("channel_poster:", ex)
-        await asyncio.sleep(70)
 
 @dp.message(Command("post"))
 async def cmd_post(msg: Message):
@@ -1745,7 +1801,9 @@ async def db_picked_keys(user_id):
     except Exception:
         return set()
 
-async def db_settle_match(match_key, outcome, ai_correct):
+async def db_settle_match(match_key, outcome, ai_correct, ai_played=True):
+    # Баллы: угадал исход — +10; +15 только если ИИ реально дал прогноз И ошибся (игрок обыграл ИИ).
+    # Если мнения ИИ по матчу не было (ai_played=False) — обыгрыша нет, начисляем +10.
     if not _pool:
         return
     try:
@@ -1753,13 +1811,33 @@ async def db_settle_match(match_key, outcome, ai_correct):
             await c.execute(
                 """UPDATE picks SET
                      result = CASE WHEN pick=$2 THEN 'win' ELSE 'lose' END,
-                     points = CASE WHEN pick=$2 THEN (CASE WHEN $3 THEN 10 ELSE 15 END) ELSE 0 END,
-                     beat_ai = (pick=$2 AND NOT $3),
+                     points = CASE WHEN pick=$2 THEN (CASE WHEN ($4 AND NOT $3) THEN 15 ELSE 10 END) ELSE 0 END,
+                     beat_ai = (pick=$2 AND $4 AND NOT $3),
                      settled_at = now()
                    WHERE match_key=$1 AND pick IN ('1','X','2') AND (result='pending' OR result IS NULL)""",
-                match_key, outcome, bool(ai_correct))
+                match_key, outcome, bool(ai_correct), bool(ai_played))
     except Exception as ex:
         print("db_settle_match:", ex)
+
+async def db_pending_match_keys():
+    """Ключи матчей с незавершёнными прогнозами — для устойчивого к переименованию расчёта."""
+    if not _pool:
+        return []
+    try:
+        async with _pool.acquire() as c:
+            rows = await c.fetch(
+                "SELECT DISTINCT match_key FROM picks WHERE pick IN ('1','X','2') AND (result='pending' OR result IS NULL)")
+        return [r["match_key"] for r in rows]
+    except Exception as ex:
+        print("db_pending_match_keys:", ex)
+        return []
+
+def _norm_match_key(match_key):
+    """Нормализует ключ 'дата|хозяева|гости' (имена команд) для сравнения при расчёте."""
+    parts = str(match_key).split("|")
+    if len(parts) != 3:
+        return match_key
+    return f"{parts[0]}|{_norm_team_name(parts[1])}|{_norm_team_name(parts[2])}"
 
 async def db_leaderboard(limit=10):
     if not _pool:
@@ -1822,13 +1900,25 @@ async def settle_user_picks():
     data, res = await get_data()
     if not data:
         return
+    # Карта «нормализованный ключ → реальный ключ прогноза» — чтобы косметическое
+    # переименование команды между сохранением пика и расчётом не потеряло прогноз.
+    norm_map = {}
+    for k in await db_pending_match_keys():
+        norm_map.setdefault(_norm_match_key(k), k)
     for t, i, m in all_matches(data):
         # Счёт берём и из m.ft, и из results.json (res) — источник может прислать
         # итог только в results.json, тогда m.ft пустой и расчёт раньше не срабатывал.
         oc = _outcome_from_score(score_for_match(m, res))
         if not oc:
             continue
-        await db_settle_match(_mkey(m), oc, _ai_outcome(m) == oc)
+        ai_out = _ai_outcome(m)
+        ai_played = ai_out is not None
+        ai_correct = (ai_out == oc)
+        mk = _mkey(m)
+        await db_settle_match(mk, oc, ai_correct, ai_played)
+        legacy = norm_map.get(_norm_match_key(mk))
+        if legacy and legacy != mk:
+            await db_settle_match(legacy, oc, ai_correct, ai_played)
 
 async def settle_loop(bot):
     if not DATABASE_URL:
