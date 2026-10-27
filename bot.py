@@ -1617,7 +1617,7 @@ async def post_daily(bot):
     return True
 
 
-POST_TIMES = [(12, 0)]  # ежедневный пост в канал в 12:00 МСК
+POST_TIMES = [(13, 30)]  # ежедневный пост в канал в 13:30 МСК (после обновления данных в 13:15)
 async def channel_poster(bot):
     if not REQUIRED_CHAT:
         return
@@ -1958,13 +1958,14 @@ async def cb_iqtop(c: CallbackQuery):
     await _send(c.message, True, await _leaderboard_text(c.from_user.id, res), b.as_markup())
 
 
-# ================= Уведомления (рассылка всем пользователям) =================
+# ================= Уведомления (публикация в канал) =================
 # Три типа: утренний прогноз дня, напоминание за час до матча, итог после матча.
+# Все сообщения идут в канал (REQUIRED_CHAT), НЕ в личные сообщения пользователям.
 # Дедупликация — через таблицу notifications (INSERT ... ON CONFLICT DO NOTHING RETURNING).
 
 NOTIFY_INTERVAL = 150          # период проверки петли, сек (~2.5 мин)
-NOTIFY_SEND_PAUSE = 0.06       # пауза между отправками при рассылке, сек
-NOTIFY_MORNING_HOUR = 10       # час МСК для утреннего прогноза дня
+NOTIFY_MORNING_HM = (13, 30)   # время утреннего прогноза дня, МСК (после обновления данных в 13:15)
+NOTIFY_MORNING_WINDOW = 120    # окно ретраев после NOTIFY_MORNING_HM, мин (если данные задержались)
 NOTIFY_PRE_MIN = 55            # нижняя граница окна «за час до матча», мин
 NOTIFY_PRE_MAX = 65            # верхняя граница окна «за час до матча», мин
 NOTIFY_RESULT_MIN_AGE = 90     # матч попадает в «итоги», если стартовал не раньше, мин
@@ -1987,29 +1988,19 @@ async def _notify_claim(key):
         return False
 
 
-async def _notify_all_users(bot, text):
-    """Рассылка текста всем пользователям из таблицы users.
+async def _notify_channel(bot, text):
+    """Публикация уведомления в канал (REQUIRED_CHAT), а не в личные сообщения.
     Длинный текст режется на части; каждая отправка защищена try/except."""
-    if not _pool:
-        return 0
-    try:
-        async with _pool.acquire() as c:
-            rows = await c.fetch("SELECT user_id FROM users")
-    except Exception as ex:
-        print("notify fetch users:", ex)
+    if not REQUIRED_CHAT:
         return 0
     chunks = _split_telegram_text(text)
     sent = 0
-    for r in rows:
-        uid = r["user_id"]
+    for chunk in chunks:
         try:
-            for chunk in chunks:
-                await bot.send_message(uid, chunk, disable_web_page_preview=True)
+            await bot.send_message(REQUIRED_CHAT, chunk, disable_web_page_preview=True)
             sent += 1
-        except Exception:
-            # пользователь мог заблокировать бота или удалить чат — пропускаем, не падаем
-            pass
-        await asyncio.sleep(NOTIFY_SEND_PAUSE)
+        except Exception as ex:
+            print("notify channel send:", ex)
     return sent
 
 
@@ -2024,9 +2015,13 @@ def _notify_lineups(m):
 
 
 async def _notify_morning(bot):
-    """Раз в день около NOTIFY_MORNING_HOUR:00 МСК — «Прогноз дня готов» + лучший прогноз."""
+    """Раз в день около NOTIFY_MORNING_HM МСК — «Прогноз дня готов» + лучший прогноз.
+    Окно 0..NOTIFY_MORNING_WINDOW мин после целевого времени даёт ретраи, если данные задержались."""
     now = datetime.datetime.now(MSK_TZ)
-    if now.hour != NOTIFY_MORNING_HOUR:
+    target = now.replace(hour=NOTIFY_MORNING_HM[0], minute=NOTIFY_MORNING_HM[1],
+                         second=0, microsecond=0)
+    mins_since = (now - target).total_seconds() / 60.0
+    if not (0 <= mins_since <= NOTIFY_MORNING_WINDOW):
         return
     today = now.date().isoformat()
     data, res = await get_data()
@@ -2050,8 +2045,8 @@ async def _notify_morning(bot):
             "загляните в приложение за полным списком матчей. 18+"
         )
     if await _notify_claim(f"morning|{today}"):
-        n = await _notify_all_users(bot, text)
-        print(f"notify morning: разослано {n} ({today})")
+        n = await _notify_channel(bot, text)
+        print(f"notify morning: отправлено в канал ({today}), частей {n}")
 
 
 async def _notify_prematch(bot):
@@ -2093,8 +2088,8 @@ async def _notify_prematch(bot):
                     line += f" · выбор ИИ: <b>{PICK_LABEL.get(ai, ai)}</b>"
                 out.append(line)
             out.append("\n<i>Составы — в карточке матча в приложении.</i>\n18+")
-        n = await _notify_all_users(bot, "\n".join(out))
-        print(f"notify pre: {date} {tm}, матчей {len(matches)}, разослано {n}")
+        n = await _notify_channel(bot, "\n".join(out))
+        print(f"notify pre: {date} {tm}, матчей {len(matches)}, частей {n}")
 
 
 async def _notify_results(bot):
@@ -2136,13 +2131,14 @@ async def _notify_results(bot):
                 head, tail = "🏁 Итог", ""
             out.append(f"{head}: <b>{e(m.get('home'))} {e(ft)} {e(m.get('away'))}</b>{tail}")
         out.append("\n18+")
-        n = await _notify_all_users(bot, "\n".join(out))
-        print(f"notify result: матчей {len(matches)}, разослано {n}")
+        n = await _notify_channel(bot, "\n".join(out))
+        print(f"notify result: матчей {len(matches)}, частей {n}")
 
 
 async def notify_loop(bot):
-    """Фоновая петля уведомлений: проверяет три условия каждые ~NOTIFY_INTERVAL сек."""
-    if not DATABASE_URL:
+    """Фоновая петля уведомлений: проверяет три условия каждые ~NOTIFY_INTERVAL сек.
+    Нужны и база (для дедупликации), и канал (куда публиковать)."""
+    if not DATABASE_URL or not REQUIRED_CHAT:
         return
     while True:
         for step in (_notify_morning, _notify_prematch, _notify_results):
