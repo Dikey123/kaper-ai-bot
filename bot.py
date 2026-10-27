@@ -1692,10 +1692,13 @@ def _kickoff(m):
         return None
 
 def _upcoming(data):
+    # Прогнозы принимаем ТОЛЬКО на матчи сегодня (МСК), ещё не начавшиеся.
+    # Дата вычисляется при каждом вызове, поэтому список сам обновляется каждый день.
     now = datetime.datetime.now(MSK_TZ)
+    today = now.date().isoformat()
     out = []
     for t, i, m in all_matches(data):
-        if m.get("ft"):
+        if m.get("ft") or m.get("date") != today:
             continue
         k = _kickoff(m)
         if not k or k <= now:
@@ -1816,11 +1819,13 @@ def ai_week_record(res):
     return w, t
 
 async def settle_user_picks():
-    data, _ = await get_data()
+    data, res = await get_data()
     if not data:
         return
     for t, i, m in all_matches(data):
-        oc = _outcome_from_score(m.get("ft"))
+        # Счёт берём и из m.ft, и из results.json (res) — источник может прислать
+        # итог только в results.json, тогда m.ft пустой и расчёт раньше не срабатывал.
+        oc = _outcome_from_score(score_for_match(m, res))
         if not oc:
             continue
         await db_settle_match(_mkey(m), oc, _ai_outcome(m) == oc)
@@ -1837,9 +1842,13 @@ async def settle_loop(bot):
 
 def _pick_kb(m, user_pick):
     h = _mhash(_mkey(m))
+    odds = m.get("odds") or []
+    def _od(i):
+        v = _valid_decimal(odds[i] if i < len(odds) else None)
+        return f" {v:.2f}" if v else ""
     b = InlineKeyboardBuilder()
-    for code, lbl in (("1", "П1 (хоз.)"), ("X", "Ничья"), ("2", "П2 (гости)")):
-        b.button(text=("✅ " if user_pick == code else "") + lbl, callback_data=f"iq:{h}:{code}")
+    for code, lbl, i in (("1", "П1", 0), ("X", "Ничья", 1), ("2", "П2", 2)):
+        b.button(text=("✅ " if user_pick == code else "") + lbl + _od(i), callback_data=f"iq:{h}:{code}")
     b.button(text="Пропустить ⏭", callback_data=f"iqs:{h}")
     b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
     b.button(text="⬅️ В меню", callback_data="menu")
@@ -1851,7 +1860,9 @@ def _match_prompt(m, idx, total):
     tm = k.strftime("%d.%m в %H:%M") if k else (m.get("time") or "")
     return (f"🎮 <b>Обыграй ИИ</b> · матч {idx} из {total}\n\n"
             f"<b>{e(m.get('home'))} — {e(m.get('away'))}</b>\n🗓 {e(tm)} МСК\n\n"
-            f"Как сыграют? Выбери исход — после матча сравним с прогнозом ИИ.")
+            f"Как сыграют? Выбери исход — после матча сравним с прогнозом ИИ.\n\n"
+            f"<i>Очки: +10 за угаданный исход, +15 — если при этом обыграешь ИИ "
+            f"(ты угадал, а ИИ ошибся). Коэффициенты — на кнопках. 18+</i>")
 
 async def _send(target, edit, text, kb=None):
     try:
