@@ -1372,7 +1372,7 @@ def _daily_rating_block(res):
 
 
 def _daily_ai_results_block(res, today):
-    """Поматчевый разбор: какие ставки ИИ зашли/не зашли во вчерашний (или последний сыгранный) день."""
+    """Поматчевый разбор угаданных исходов ИИ строго за календарное вчера (поле ai)."""
     recent = (res or {}).get("recent") or []
     if not recent:
         return ""
@@ -1381,8 +1381,7 @@ def _daily_ai_results_block(res, today):
         return [
             r for r in recent
             if r.get("date") == date
-            and (r.get("gpt_bet") or "").strip()
-            and (r.get("gpt70") or r.get("gpt60")) in ("win", "lose", "push")
+            and r.get("ai") in ("win", "lose", "push")
         ]
 
     try:
@@ -1392,29 +1391,19 @@ def _daily_ai_results_block(res, today):
     day = yesterday
     picks = picks_for(yesterday)
     if not picks:
-        past = sorted(
-            {r.get("date") for r in recent if r.get("date") and r.get("date") < today},
-            reverse=True,
-        )
-        for d in past:
-            p = picks_for(d)
-            if p:
-                day, picks = d, p
-                break
-    if not picks:
         return ""
 
-    result_of = lambda row: row.get("gpt70") or row.get("gpt60")
+    result_of = lambda row: row.get("ai")
     win = sum(1 for r in picks if result_of(r) == "win")
     total = len(picks)
-    out = [f"📋 <b>Итоги ставок ИИ за {e(dlabel(day))}:</b>"]
+    out = [f"📋 <b>Итоги прогнозов ИИ за {e(dlabel(day))}:</b>"]
     for r in picks[:8]:
         result = result_of(r)
         icon = "✅" if result == "win" else ("↩️" if result == "push" else "❌")
-        out.append(f"{icon} {e(r.get('home'))} {e(r.get('score', ''))} {e(r.get('away'))} · {e(r.get('gpt_bet'))}")
+        out.append(f"{icon} {e(r.get('home'))} {e(r.get('score', ''))} {e(r.get('away'))}")
     if total > 8:
         out.append(f"<i>…и ещё {total - 8}</i>")
-    out.append(f"<b>Зашло {win} из {total}</b>")
+    out.append(f"<b>Угадано {win} из {total}</b>")
     return "\n".join(out)
 
 
