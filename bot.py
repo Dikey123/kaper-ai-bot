@@ -1959,13 +1959,12 @@ async def cb_iqtop(c: CallbackQuery):
 
 
 # ================= Уведомления (публикация в канал) =================
-# Три типа: утренний прогноз дня, напоминание за час до матча, итог после матча.
+# Два типа: напоминание за час до матча и итог после матча.
+# (Прогноз дня даёт ежедневный пост channel_poster/post_daily в 13:30.)
 # Все сообщения идут в канал (REQUIRED_CHAT), НЕ в личные сообщения пользователям.
 # Дедупликация — через таблицу notifications (INSERT ... ON CONFLICT DO NOTHING RETURNING).
 
 NOTIFY_INTERVAL = 150          # период проверки петли, сек (~2.5 мин)
-NOTIFY_MORNING_HM = (13, 30)   # время утреннего прогноза дня, МСК (после обновления данных в 13:15)
-NOTIFY_MORNING_WINDOW = 120    # окно ретраев после NOTIFY_MORNING_HM, мин (если данные задержались)
 NOTIFY_PRE_MIN = 55            # нижняя граница окна «за час до матча», мин
 NOTIFY_PRE_MAX = 65            # верхняя граница окна «за час до матча», мин
 NOTIFY_RESULT_MIN_AGE = 90     # матч попадает в «итоги», если стартовал не раньше, мин
@@ -2014,39 +2013,9 @@ def _notify_lineups(m):
     return ""
 
 
-async def _notify_morning(bot):
-    """Раз в день около NOTIFY_MORNING_HM МСК — «Прогноз дня готов» + лучший прогноз.
-    Окно 0..NOTIFY_MORNING_WINDOW мин после целевого времени даёт ретраи, если данные задержались."""
-    now = datetime.datetime.now(MSK_TZ)
-    target = now.replace(hour=NOTIFY_MORNING_HM[0], minute=NOTIFY_MORNING_HM[1],
-                         second=0, microsecond=0)
-    mins_since = (now - target).total_seconds() / 60.0
-    if not (0 <= mins_since <= NOTIFY_MORNING_WINDOW):
-        return
-    today = now.date().isoformat()
-    data, res = await get_data()
-    if not data:
-        return  # нет данных — попробуем в следующем проходе, ключ не тратим
-    candidates = _daily_model_candidates(data, res, today)
-    if candidates:
-        best = candidates[0]
-        price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
-        meta = (f" · {e(best['time'])} МСК" if best.get("time") else "")
-        text = (
-            "🎯 <b>Прогноз дня готов</b>\n\n"
-            f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}{meta}\n"
-            f"Выбор ИИ: <b>{e(best['bet'])}</b> — кф <b>{price}</b>\n\n"
-            "Все матчи и прогнозы — в приложении. 18+"
-        )
-    else:
-        text = (
-            "🎯 <b>Прогноз дня готов</b>\n\n"
-            "Сегодня нет уверенного прогноза с проверяемым коэффициентом — "
-            "загляните в приложение за полным списком матчей. 18+"
-        )
-    if await _notify_claim(f"morning|{today}"):
-        n = await _notify_channel(bot, text)
-        print(f"notify morning: отправлено в канал ({today}), частей {n}")
+# Утренний тизер «Прогноз дня готов» убран: его содержимое полностью покрывает
+# ежедневный пост канала в 13:30 (channel_poster/post_daily), где уже есть блок
+# «Лучший прогноз дня». Оставлены напоминания за час до матча и итоги матчей.
 
 
 async def _notify_prematch(bot):
@@ -2141,7 +2110,7 @@ async def notify_loop(bot):
     if not DATABASE_URL or not REQUIRED_CHAT:
         return
     while True:
-        for step in (_notify_morning, _notify_prematch, _notify_results):
+        for step in (_notify_prematch, _notify_results):
             try:
                 await step(bot)
             except Exception as ex:
