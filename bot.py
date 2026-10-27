@@ -1763,10 +1763,14 @@ def _upcoming(data):
     out.sort(key=lambda x: x[0])
     return [m for _, m in out]
 
-def _week_start_iso():
+def _week_start_dt():
+    # Начало недели (понедельник 00:00 МСК) как объект datetime — для параметров SQL.
+    # asyncpg требует datetime для timestamptz; строка приводила к ошибке и пустой таблице.
     now = datetime.datetime.now(MSK_TZ)
-    monday = (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    return monday.isoformat()
+    return (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
+def _week_start_iso():
+    return _week_start_dt().isoformat()
 
 async def db_save_pick(user, match_key, pick):
     if not _pool or user is None:
@@ -1851,11 +1855,11 @@ async def db_leaderboard(limit=10):
                       COUNT(*) FILTER (WHERE p.result IN ('win','lose')) AS total,
                       COUNT(*) FILTER (WHERE p.beat_ai) AS beat
                    FROM picks p LEFT JOIN users u ON u.user_id = p.user_id
-                   WHERE p.settled_at >= $1::timestamptz
+                   WHERE p.settled_at >= $1
                    GROUP BY p.user_id, u.username, u.first_name
                    HAVING COUNT(*) FILTER (WHERE p.result IN ('win','lose')) > 0
                    ORDER BY pts DESC, wins DESC LIMIT $2""",
-                _week_start_iso(), limit)
+                _week_start_dt(), limit)
         return [dict(r) for r in rows]
     except Exception as ex:
         print("db_leaderboard:", ex)
@@ -1865,7 +1869,7 @@ async def db_user_week(user_id):
     if not _pool:
         return None
     try:
-        ws = _week_start_iso()
+        ws = _week_start_dt()
         async with _pool.acquire() as c:
             r = await c.fetchrow(
                 """SELECT SUM(COALESCE(points,0)) AS pts,
@@ -1873,12 +1877,12 @@ async def db_user_week(user_id):
                       COUNT(*) FILTER (WHERE result IN ('win','lose')) AS total,
                       COUNT(*) FILTER (WHERE beat_ai) AS beat,
                       COUNT(*) FILTER (WHERE (result='pending' OR result IS NULL) AND pick IN ('1','X','2')) AS pending
-                   FROM picks WHERE user_id=$1 AND (settled_at >= $2::timestamptz OR result='pending' OR result IS NULL)""",
+                   FROM picks WHERE user_id=$1 AND (settled_at >= $2 OR result='pending' OR result IS NULL)""",
                 user_id, ws)
             rank = await c.fetchval(
-                """WITH lb AS (SELECT user_id, SUM(COALESCE(points,0)) pts FROM picks WHERE settled_at>=$2::timestamptz GROUP BY user_id)
+                """WITH lb AS (SELECT user_id, SUM(COALESCE(points,0)) pts FROM picks WHERE settled_at>=$2 GROUP BY user_id)
                    SELECT COUNT(*)+1 FROM lb WHERE pts > COALESCE(
-                     (SELECT SUM(COALESCE(points,0)) FROM picks WHERE user_id=$1 AND settled_at>=$2::timestamptz), 0)""",
+                     (SELECT SUM(COALESCE(points,0)) FROM picks WHERE user_id=$1 AND settled_at>=$2), 0)""",
                 user_id, ws)
         return dict(r, rank=rank) if r else None
     except Exception as ex:
