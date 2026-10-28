@@ -2405,13 +2405,73 @@ async def _notify_results(bot):
         print(f"notify result: матчей {len(matches)}, частей {n}")
 
 
+async def db_recent_settled():
+    """Рассчитанные за последние 12 ч прогнозы игроков — для личных итогов."""
+    if not _pool:
+        return []
+    try:
+        async with _pool.acquire() as c:
+            rows = await c.fetch(
+                """SELECT user_id, match_key, pick, result, beat_ai, ai_pick, score
+                   FROM picks
+                   WHERE pick IN ('1','X','2') AND result IN ('win','lose')
+                     AND settled_at >= now() - interval '12 hours'""")
+        return [dict(r) for r in rows]
+    except Exception as ex:
+        print("db_recent_settled:", ex)
+        return []
+
+
+async def _notify_player_results(bot):
+    """Личное сообщение каждому игроку с его итогом по матчу + что сказал ИИ. Один раз на (игрок, матч)."""
+    if not _pool:
+        return
+    sent = 0
+    for r in await db_recent_settled():
+        if not await _notify_claim(f"userres|{r['user_id']}|{r['match_key']}"):
+            continue
+        parts = str(r["match_key"]).split("|")
+        home, away = (parts[1], parts[2]) if len(parts) == 3 else (r["match_key"], "")
+        sc = (r["score"] or "").strip()
+        u_ok = r["result"] == "win"
+        out = ["✅ <b>Ты угадал!</b>" if u_ok else "❌ <b>Не зашло</b>",
+               f"<b>{e(home)} {e(sc)} {e(away)}</b>",
+               f"Твой выбор: {PICK_LABEL.get(r['pick'], r['pick'])} {'✅' if u_ok else '❌'}"]
+        ai_code = r["ai_pick"]
+        if ai_code in ("1", "X", "2"):
+            outcome = _outcome_from_score(sc) if sc else None
+            ai_ok = outcome is not None and ai_code == outcome
+            out.append(f"Прогноз ИИ: {PICK_LABEL.get(ai_code, ai_code)} {'✅' if ai_ok else '❌'}")
+            if r["beat_ai"]:
+                out.append("🔥 <b>Ты обыграл ИИ!</b>")
+            elif ai_ok and not u_ok:
+                out.append("ИИ в этот раз оказался прав.")
+        pts = 15 if r["beat_ai"] else (10 if u_ok else 0)
+        if pts:
+            out.append(f"\n<b>+{pts}</b> очк. в таблицу недели")
+        b = InlineKeyboardBuilder()
+        b.button(text="🎮 Новый прогноз", callback_data="iqplay")
+        b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
+        try:
+            await bot.send_message(r["user_id"], "\n".join(out), reply_markup=b.as_markup(), disable_web_page_preview=True)
+            sent += 1
+        except Exception as ex:
+            print("player result send:", ex)
+        await asyncio.sleep(0.06)
+    if sent:
+        print(f"notify player results: отправлено {sent}")
+
+
 async def notify_loop(bot):
-    """Фоновая петля уведомлений: проверяет три условия каждые ~NOTIFY_INTERVAL сек.
-    Нужны и база (для дедупликации), и канал (куда публиковать)."""
-    if not DATABASE_URL or not REQUIRED_CHAT:
+    """Фоновая петля: расчёт «Обыграй ИИ» по живому счёту + уведомления. Каждые ~NOTIFY_INTERVAL сек."""
+    if not DATABASE_URL:
         return
     while True:
-        for step in (_notify_prematch, _notify_results):
+        try:
+            await settle_user_picks()  # по живому ESPN — чтобы личные итоги приходили сразу
+        except Exception as ex:
+            print("notify settle:", ex)
+        for step in (_notify_prematch, _notify_results, _notify_player_results):
             try:
                 await step(bot)
             except Exception as ex:
