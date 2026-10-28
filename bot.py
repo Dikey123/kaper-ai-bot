@@ -87,6 +87,7 @@ async def db_init():
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS beat_ai boolean;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS settled_at timestamptz;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS ai_pick text;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS ai_won boolean;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS score text;
                 CREATE TABLE IF NOT EXISTS notifications(
                     key text PRIMARY KEY,
@@ -1701,6 +1702,29 @@ def _ai_outcome(m):
             return "X"
     return None
 
+def _settle_key_won(key, oc):
+    """Выиграла ли ставка рынка key при исходе oc ('1'/'X'/'2'). None — рынок не считается по исходу (тотал/фора/ОЗ)."""
+    return {
+        "result_1": oc == "1", "result_x": oc == "X", "result_2": oc == "2",
+        "dc_1x": oc in ("1", "X"), "dc_x2": oc in ("X", "2"), "dc_12": oc in ("1", "2"),
+    }.get(key)
+
+def _ai_bet(m, score):
+    """Реальная ставка ИИ (код, напр. «Х2»/«1Х»/«П1») и выиграла ли она — как в settle.py (с двойным шансом).
+    Приоритет ai (Claude), затем gpt. Возвращает (код_или_None, won_или_None); won=None — рынок по исходу не рассчитать."""
+    oc = _outcome_from_score(score)
+    if not oc:
+        return None, None
+    for k in ("ai", "gpt"):
+        op = m.get(k) or {}
+        if not isinstance(op, dict):
+            continue
+        pick = str(op.get("pick") or op.get("bet") or "").strip()
+        if not pick:
+            continue
+        return pick, _settle_key_won(_pick_key(pick, m), oc)
+    return None, None
+
 def _kickoff(m):
     try:
         return datetime.datetime.strptime(
@@ -1781,6 +1805,7 @@ async def db_settle_match(match_key, outcome, ai_correct, ai_played=True, ai_pic
                      points = CASE WHEN pick=$2 THEN (CASE WHEN ($4 AND NOT $3) THEN 15 ELSE 10 END) ELSE 0 END,
                      beat_ai = (pick=$2 AND $4 AND NOT $3),
                      ai_pick = $5,
+                     ai_won = $3,
                      score = $6,
                      settled_at = now()
                    WHERE match_key=$1 AND pick IN ('1','X','2') AND (result='pending' OR result IS NULL)""",
@@ -1861,7 +1886,7 @@ async def db_my_picks(user_id, limit=20):
     try:
         async with _pool.acquire() as c:
             rows = await c.fetch(
-                """SELECT match_key, pick, result, points, beat_ai, ai_pick, score, created_at, settled_at
+                """SELECT match_key, pick, result, points, beat_ai, ai_pick, ai_won, score, created_at, settled_at
                    FROM picks WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2""",
                 user_id, limit)
         return [dict(r) for r in rows]
@@ -1879,6 +1904,27 @@ def ai_week_record(res):
             t += 1
             w += (r.get("ai") == "win")
     return w, t
+
+async def db_backfill_ai(match_key, ai_pick, ai_won, ai_played, score):
+    """Дозаполняет ставку ИИ/счёт у УЖЕ рассчитанных прогнозов (где раньше не сохранялось)
+    и пересчитывает beat_ai/points корректно (с двойным шансом). Трогает только записи с пустым ai_pick."""
+    if not _pool or not ai_pick:
+        return
+    try:
+        async with _pool.acquire() as c:
+            await c.execute(
+                """UPDATE picks SET
+                     ai_pick = $2,
+                     ai_won = $3,
+                     score = COALESCE(score, $5),
+                     beat_ai = (result='win' AND $4 AND NOT $3),
+                     points = CASE WHEN result='win' THEN (CASE WHEN ($4 AND NOT $3) THEN 15 ELSE 10 END)
+                                   WHEN result='lose' THEN 0 ELSE points END
+                   WHERE match_key=$1 AND pick IN ('1','X','2') AND result IN ('win','lose') AND ai_pick IS NULL""",
+                match_key, ai_pick, bool(ai_won), bool(ai_played), score)
+    except Exception as ex:
+        print("db_backfill_ai:", ex)
+
 
 async def settle_user_picks():
     data, res = await get_data()
@@ -1899,14 +1945,15 @@ async def settle_user_picks():
         if not oc:
             continue
         sc = re.sub(r"\s*[-:]\s*", ":", str(sc)).strip()
-        ai_out = _ai_outcome(m)
-        ai_played = ai_out is not None
-        ai_correct = (ai_out == oc)
+        ai_code, ai_won = _ai_bet(m, sc)            # реальная ставка ИИ (с двойным шансом)
+        ai_played = ai_code is not None and ai_won is not None
         mk = _mkey(m)
-        await db_settle_match(mk, oc, ai_correct, ai_played, ai_out, sc)
+        await db_settle_match(mk, oc, bool(ai_won), ai_played, ai_code, sc)
+        await db_backfill_ai(mk, ai_code, ai_won, ai_played, sc)   # дозаполнить старые записи
         legacy = norm_map.get(_norm_match_key(mk))
         if legacy and legacy != mk:
-            await db_settle_match(legacy, oc, ai_correct, ai_played, ai_out, sc)
+            await db_settle_match(legacy, oc, bool(ai_won), ai_played, ai_code, sc)
+            await db_backfill_ai(legacy, ai_code, ai_won, ai_played, sc)
 
 async def settle_loop(bot):
     if not DATABASE_URL:
@@ -2035,14 +2082,14 @@ async def _render_mypicks(user_id):
             u_ok = r["result"] == "win"
             u_mark = "✅" if u_ok else "❌"
             u_pick = PICK_LABEL.get(r["pick"], r["pick"])
-            ai_pick_code = r["ai_pick"]
-            if ai_pick_code in ("1", "X", "2"):
-                outcome = _outcome_from_score(sc) if sc else None
-                ai_ok = (outcome is not None and ai_pick_code == outcome)
-                ai_part = f"ИИ {PICK_LABEL.get(ai_pick_code, ai_pick_code)} {'✅' if ai_ok else '❌'}"
+            ai_code = r["ai_pick"]
+            if ai_code:
+                aw = r["ai_won"]
+                ai_mark = "✅" if aw else ("❌" if aw is False else "")
+                ai_part = f"ИИ {e(ai_code)}" + (f" {ai_mark}" if ai_mark else "")
                 if r["beat_ai"]:
                     note = " 🔥 обыграл ИИ"
-                elif ai_ok and not u_ok:
+                elif aw and not u_ok:
                     note = " · ИИ оказался прав"
                 else:
                     note = ""
@@ -2390,13 +2437,10 @@ async def _notify_results(bot):
             out.append("📣 <b>Итоги матчей</b>\n")
         for m, ft in matches:
             ft = re.sub(r"\s*[-:]\s*", ":", str(ft)).strip()
-            oc = _outcome_from_score(ft)
-            ai = _ai_outcome(m)
-            if ai and oc:
-                if ai == oc:
-                    head, tail = "✅ ИИ угадал", f" (прогноз ИИ {PICK_LABEL.get(ai, ai)})"
-                else:
-                    head, tail = "❌ Не зашло", f" (прогноз ИИ {PICK_LABEL.get(ai, ai)})"
+            ai_code, ai_won = _ai_bet(m, ft)
+            if ai_code and ai_won is not None:
+                head = "✅ ИИ угадал" if ai_won else "❌ Не зашло"
+                tail = f" (прогноз ИИ {e(ai_code)})"
             else:
                 head, tail = "🏁 Итог", ""
             out.append(f"{head}: <b>{e(m.get('home'))} {e(ft)} {e(m.get('away'))}</b>{tail}")
@@ -2412,7 +2456,7 @@ async def db_recent_settled():
     try:
         async with _pool.acquire() as c:
             rows = await c.fetch(
-                """SELECT user_id, match_key, pick, result, beat_ai, ai_pick, score
+                """SELECT user_id, match_key, pick, result, beat_ai, ai_pick, ai_won, score
                    FROM picks
                    WHERE pick IN ('1','X','2') AND result IN ('win','lose')
                      AND settled_at >= now() - interval '12 hours'""")
@@ -2438,13 +2482,13 @@ async def _notify_player_results(bot):
                f"<b>{e(home)} {e(sc)} {e(away)}</b>",
                f"Твой выбор: {PICK_LABEL.get(r['pick'], r['pick'])} {'✅' if u_ok else '❌'}"]
         ai_code = r["ai_pick"]
-        if ai_code in ("1", "X", "2"):
-            outcome = _outcome_from_score(sc) if sc else None
-            ai_ok = outcome is not None and ai_code == outcome
-            out.append(f"Прогноз ИИ: {PICK_LABEL.get(ai_code, ai_code)} {'✅' if ai_ok else '❌'}")
+        if ai_code:
+            aw = r["ai_won"]
+            ai_mark = "✅" if aw else ("❌" if aw is False else "")
+            out.append(f"Прогноз ИИ: {e(ai_code)}" + (f" {ai_mark}" if ai_mark else ""))
             if r["beat_ai"]:
                 out.append("🔥 <b>Ты обыграл ИИ!</b>")
-            elif ai_ok and not u_ok:
+            elif aw and not u_ok:
                 out.append("ИИ в этот раз оказался прав.")
         pts = 15 if r["beat_ai"] else (10 if u_ok else 0)
         if pts:
