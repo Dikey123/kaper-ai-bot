@@ -1672,7 +1672,10 @@ async def cmd_post(msg: Message):
 # ================= Обыграй ИИ (прогнозы пользователей против ИИ) =================
 import hashlib as _hl
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
-PICK_LABEL = {"1": "П1", "X": "Х", "2": "П2"}
+PICK_LABEL = {"1": "П1", "X": "Х", "2": "П2", "1X": "1Х", "12": "12", "X2": "Х2"}
+VALID_PICKS = ("1", "X", "2", "1X", "12", "X2")
+# Какие ставки игрока выигрывают при исходе матча (учёт двойного шанса).
+WIN_PICKS = {"1": ["1", "1X", "12"], "X": ["X", "1X", "X2"], "2": ["2", "12", "X2"]}
 
 def _mkey(m):
     return f"{m.get('date','')}|{m.get('home','')}|{m.get('away','')}"
@@ -1791,25 +1794,28 @@ async def db_picked_keys(user_id):
     except Exception:
         return set()
 
-async def db_settle_match(match_key, outcome, ai_correct, ai_played=True, ai_pick=None, score=None):
-    # Баллы: угадал исход — +10; +15 только если ИИ реально дал прогноз И ошибся (игрок обыграл ИИ).
-    # Если мнения ИИ по матчу не было (ai_played=False) — обыгрыша нет, начисляем +10.
-    # Сохраняем прогноз ИИ (ai_pick) и счёт (score) — для прозрачного сравнения в /mypicks.
+async def db_settle_match(match_key, win_picks, ai_correct, ai_played=True, ai_pick=None, score=None):
+    # Баллы: одиночный исход +10, двойной шанс +5 (легче угадать); +5 бонус, если при этом обыграл ИИ.
+    # win_picks — список ставок, выигрывающих при исходе матча (учёт двойного шанса), см. WIN_PICKS.
     if not _pool:
         return
     try:
         async with _pool.acquire() as c:
             await c.execute(
                 """UPDATE picks SET
-                     result = CASE WHEN pick=$2 THEN 'win' ELSE 'lose' END,
-                     points = CASE WHEN pick=$2 THEN (CASE WHEN ($4 AND NOT $3) THEN 15 ELSE 10 END) ELSE 0 END,
-                     beat_ai = (pick=$2 AND $4 AND NOT $3),
+                     result = CASE WHEN pick = ANY($2) THEN 'win' ELSE 'lose' END,
+                     points = CASE WHEN pick = ANY($2)
+                                   THEN (CASE WHEN pick IN ('1','X','2') THEN 10 ELSE 5 END)
+                                        + (CASE WHEN ($4 AND NOT $3) THEN 5 ELSE 0 END)
+                                   ELSE 0 END,
+                     beat_ai = (pick = ANY($2) AND $4 AND NOT $3),
                      ai_pick = $5,
                      ai_won = $3,
                      score = $6,
                      settled_at = now()
-                   WHERE match_key=$1 AND pick IN ('1','X','2') AND (result='pending' OR result IS NULL)""",
-                match_key, outcome, bool(ai_correct), bool(ai_played), ai_pick, score)
+                   WHERE match_key=$1 AND pick = ANY(ARRAY['1','X','2','1X','12','X2'])
+                         AND (result='pending' OR result IS NULL)""",
+                match_key, win_picks, bool(ai_correct), bool(ai_played), ai_pick, score)
     except Exception as ex:
         print("db_settle_match:", ex)
 
@@ -1820,7 +1826,7 @@ async def db_pending_match_keys():
     try:
         async with _pool.acquire() as c:
             rows = await c.fetch(
-                "SELECT DISTINCT match_key FROM picks WHERE pick IN ('1','X','2') AND (result='pending' OR result IS NULL)")
+                "SELECT DISTINCT match_key FROM picks WHERE pick = ANY(ARRAY['1','X','2','1X','12','X2']) AND (result='pending' OR result IS NULL)")
         return [r["match_key"] for r in rows]
     except Exception as ex:
         print("db_pending_match_keys:", ex)
@@ -1866,7 +1872,7 @@ async def db_user_week(user_id):
                       COUNT(*) FILTER (WHERE result='win') AS wins,
                       COUNT(*) FILTER (WHERE result IN ('win','lose')) AS total,
                       COUNT(*) FILTER (WHERE beat_ai) AS beat,
-                      COUNT(*) FILTER (WHERE (result='pending' OR result IS NULL) AND pick IN ('1','X','2')) AS pending
+                      COUNT(*) FILTER (WHERE (result='pending' OR result IS NULL) AND pick = ANY(ARRAY['1','X','2','1X','12','X2'])) AS pending
                    FROM picks WHERE user_id=$1 AND (settled_at >= $2 OR result='pending' OR result IS NULL)""",
                 user_id, ws)
             rank = await c.fetchval(
@@ -1920,7 +1926,7 @@ async def db_backfill_ai(match_key, ai_pick, ai_won, ai_played, score):
                      beat_ai = (result='win' AND $4 AND NOT $3),
                      points = CASE WHEN result='win' THEN (CASE WHEN ($4 AND NOT $3) THEN 15 ELSE 10 END)
                                    WHEN result='lose' THEN 0 ELSE points END
-                   WHERE match_key=$1 AND pick IN ('1','X','2') AND result IN ('win','lose') AND ai_pick IS NULL""",
+                   WHERE match_key=$1 AND pick = ANY(ARRAY['1','X','2','1X','12','X2']) AND result IN ('win','lose') AND ai_pick IS NULL""",
                 match_key, ai_pick, bool(ai_won), bool(ai_played), score)
     except Exception as ex:
         print("db_backfill_ai:", ex)
@@ -1945,14 +1951,15 @@ async def settle_user_picks():
         if not oc:
             continue
         sc = re.sub(r"\s*[-:]\s*", ":", str(sc)).strip()
+        wp = WIN_PICKS.get(oc, [])                  # какие ставки игрока зашли при этом исходе
         ai_code, ai_won = _ai_bet(m, sc)            # реальная ставка ИИ (с двойным шансом)
         ai_played = ai_code is not None and ai_won is not None
         mk = _mkey(m)
-        await db_settle_match(mk, oc, bool(ai_won), ai_played, ai_code, sc)
+        await db_settle_match(mk, wp, bool(ai_won), ai_played, ai_code, sc)
         await db_backfill_ai(mk, ai_code, ai_won, ai_played, sc)   # дозаполнить старые записи
         legacy = norm_map.get(_norm_match_key(mk))
         if legacy and legacy != mk:
-            await db_settle_match(legacy, oc, bool(ai_won), ai_played, ai_code, sc)
+            await db_settle_match(legacy, wp, bool(ai_won), ai_played, ai_code, sc)
             await db_backfill_ai(legacy, ai_code, ai_won, ai_played, sc)
 
 async def settle_loop(bot):
@@ -1971,13 +1978,19 @@ def _pick_kb(m, user_pick):
     def _od(i):
         v = _valid_decimal(odds[i] if i < len(odds) else None)
         return f" {v:.2f}" if v else ""
+    def _dc(a, bx):
+        va = _valid_decimal(odds[a] if a < len(odds) else None)
+        vb = _valid_decimal(odds[bx] if bx < len(odds) else None)
+        return f" ≈{1 / (1 / va + 1 / vb):.2f}" if (va and vb) else ""
     b = InlineKeyboardBuilder()
     for code, lbl, i in (("1", "П1", 0), ("X", "Ничья", 1), ("2", "П2", 2)):
         b.button(text=("✅ " if user_pick == code else "") + lbl + _od(i), callback_data=f"iq:{h}:{code}")
+    for code, lbl, pair in (("1X", "1Х", (0, 1)), ("12", "12", (0, 2)), ("X2", "Х2", (1, 2))):
+        b.button(text=("✅ " if user_pick == code else "") + lbl + _dc(*pair), callback_data=f"iq:{h}:{code}")
     b.button(text="Пропустить ⏭", callback_data=f"iqs:{h}")
     b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
     b.button(text="⬅️ В меню", callback_data="menu")
-    b.adjust(3, 1, 1, 1)
+    b.adjust(3, 3, 1, 1, 1)
     return b.as_markup()
 
 def _match_prompt(m, idx, total):
@@ -1985,9 +1998,9 @@ def _match_prompt(m, idx, total):
     tm = k.strftime("%d.%m в %H:%M") if k else (m.get("time") or "")
     return (f"🎮 <b>Обыграй ИИ</b> · матч {idx} из {total}\n\n"
             f"<b>{e(m.get('home'))} — {e(m.get('away'))}</b>\n🗓 {e(tm)} МСК\n\n"
-            f"Как сыграют? Выбери исход — после матча сравним с прогнозом ИИ.\n\n"
-            f"<i>Очки: +10 за угаданный исход, +15 — если при этом обыграешь ИИ "
-            f"(ты угадал, а ИИ ошибся). Коэффициенты — на кнопках. 18+</i>")
+            f"Как сыграют? Выбери исход или двойной шанс (1Х / 12 / Х2 — безопаснее).\n\n"
+            f"<i>Очки: исход +10, двойной шанс +5 (угадать легче); +5 бонус, если обыграешь ИИ. "
+            f"Коэффициенты на кнопках (≈ у двойного шанса — расчётный). 18+</i>")
 
 async def _send(target, edit, text, kb=None):
     try:
@@ -2061,7 +2074,7 @@ async def _render_mypicks(user_id):
     if not _pool:
         return ("База недоступна — прогнозы пока не сохраняются.", kb)
     rows = await db_my_picks(user_id, limit=40)
-    actual = [r for r in rows if r["pick"] in ("1", "X", "2")]
+    actual = [r for r in rows if r["pick"] in VALID_PICKS]
     if not actual:
         return ("У тебя пока нет прогнозов в «Обыграй ИИ».\n"
                 "Открой «🎮 Сделать прогноз», выбери матч и нажми исход (П1 / Ничья / П2).", kb)
@@ -2129,6 +2142,8 @@ async def cb_iq(c: CallbackQuery):
     if len(parts) != 3:
         return await c.answer()
     h, code = parts[1], parts[2]
+    if code not in VALID_PICKS:
+        return await c.answer()
     data, _ = await get_data()
     m = next((mm for t, i, mm in all_matches(data) if _mhash(_mkey(mm)) == h), None)
     if not m:
@@ -2458,7 +2473,7 @@ async def db_recent_settled():
             rows = await c.fetch(
                 """SELECT user_id, match_key, pick, result, beat_ai, ai_pick, ai_won, score
                    FROM picks
-                   WHERE pick IN ('1','X','2') AND result IN ('win','lose')
+                   WHERE pick = ANY(ARRAY['1','X','2','1X','12','X2']) AND result IN ('win','lose')
                      AND settled_at >= now() - interval '12 hours'""")
         return [dict(r) for r in rows]
     except Exception as ex:
