@@ -86,6 +86,8 @@ async def db_init():
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS points integer;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS beat_ai boolean;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS settled_at timestamptz;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS ai_pick text;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS score text;
                 CREATE TABLE IF NOT EXISTS notifications(
                     key text PRIMARY KEY,
                     created_at timestamptz NOT NULL DEFAULT now()
@@ -1765,9 +1767,10 @@ async def db_picked_keys(user_id):
     except Exception:
         return set()
 
-async def db_settle_match(match_key, outcome, ai_correct, ai_played=True):
+async def db_settle_match(match_key, outcome, ai_correct, ai_played=True, ai_pick=None, score=None):
     # Баллы: угадал исход — +10; +15 только если ИИ реально дал прогноз И ошибся (игрок обыграл ИИ).
     # Если мнения ИИ по матчу не было (ai_played=False) — обыгрыша нет, начисляем +10.
+    # Сохраняем прогноз ИИ (ai_pick) и счёт (score) — для прозрачного сравнения в /mypicks.
     if not _pool:
         return
     try:
@@ -1777,9 +1780,11 @@ async def db_settle_match(match_key, outcome, ai_correct, ai_played=True):
                      result = CASE WHEN pick=$2 THEN 'win' ELSE 'lose' END,
                      points = CASE WHEN pick=$2 THEN (CASE WHEN ($4 AND NOT $3) THEN 15 ELSE 10 END) ELSE 0 END,
                      beat_ai = (pick=$2 AND $4 AND NOT $3),
+                     ai_pick = $5,
+                     score = $6,
                      settled_at = now()
                    WHERE match_key=$1 AND pick IN ('1','X','2') AND (result='pending' OR result IS NULL)""",
-                match_key, outcome, bool(ai_correct), bool(ai_played))
+                match_key, outcome, bool(ai_correct), bool(ai_played), ai_pick, score)
     except Exception as ex:
         print("db_settle_match:", ex)
 
@@ -1856,7 +1861,7 @@ async def db_my_picks(user_id, limit=20):
     try:
         async with _pool.acquire() as c:
             rows = await c.fetch(
-                """SELECT match_key, pick, result, points, beat_ai, created_at, settled_at
+                """SELECT match_key, pick, result, points, beat_ai, ai_pick, score, created_at, settled_at
                    FROM picks WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2""",
                 user_id, limit)
         return [dict(r) for r in rows]
@@ -1887,19 +1892,21 @@ async def settle_user_picks():
     finals = await _espn_finals()  # живой счёт с ESPN — считаем «Обыграй ИИ» не дожидаясь базы
     for t, i, m in all_matches(data):
         # Счёт берём из m.ft, из results.json (res) и из живого ESPN — что раньше появится.
-        oc = _outcome_from_score(score_for_match(m, res)) or _outcome_from_score(
-            finals.get((m.get("date", ""), _rnorm(m.get("home", "")), _rnorm(m.get("away", ""))))
+        sc = score_for_match(m, res) or finals.get(
+            (m.get("date", ""), _rnorm(m.get("home", "")), _rnorm(m.get("away", "")))
         )
+        oc = _outcome_from_score(sc)
         if not oc:
             continue
+        sc = re.sub(r"\s*[-:]\s*", ":", str(sc)).strip()
         ai_out = _ai_outcome(m)
         ai_played = ai_out is not None
         ai_correct = (ai_out == oc)
         mk = _mkey(m)
-        await db_settle_match(mk, oc, ai_correct, ai_played)
+        await db_settle_match(mk, oc, ai_correct, ai_played, ai_out, sc)
         legacy = norm_map.get(_norm_match_key(mk))
         if legacy and legacy != mk:
-            await db_settle_match(legacy, oc, ai_correct, ai_played)
+            await db_settle_match(legacy, oc, ai_correct, ai_played, ai_out, sc)
 
 async def settle_loop(bot):
     if not DATABASE_URL:
@@ -1993,31 +2000,81 @@ async def cmd_play(msg: Message):
 async def cmd_top(msg: Message):
     await db_touch_user(msg.from_user)
     _, res = await get_data()
-    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="⬅️ В меню", callback_data="menu")
+    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="📋 Мои прогнозы", callback_data="iqmine"); b.button(text="⬅️ В меню", callback_data="menu")
     await msg.answer(await _leaderboard_text(msg.from_user.id, res), reply_markup=b.as_markup(), disable_web_page_preview=True)
+
+async def _render_mypicks(user_id):
+    """Экран «Мои прогнозы»: что угадал/не угадал + прогноз ИИ на тот же матч (прозрачность)."""
+    b = InlineKeyboardBuilder()
+    b.button(text="🎮 Сделать прогноз", callback_data="iqplay")
+    b.button(text="🏆 Таблица лидеров", callback_data="iqtop")
+    b.button(text="⬅️ В меню", callback_data="menu")
+    b.adjust(1, 1, 1)
+    kb = b.as_markup()
+    if not _pool:
+        return ("База недоступна — прогнозы пока не сохраняются.", kb)
+    rows = await db_my_picks(user_id, limit=40)
+    actual = [r for r in rows if r["pick"] in ("1", "X", "2")]
+    if not actual:
+        return ("У тебя пока нет прогнозов в «Обыграй ИИ».\n"
+                "Открой «🎮 Сделать прогноз», выбери матч и нажми исход (П1 / Ничья / П2).", kb)
+
+    def _mk_teams(r):
+        parts = str(r["match_key"]).split("|")
+        return (parts[1], parts[2]) if len(parts) == 3 else (r["match_key"], "")
+
+    settled = [r for r in actual if r["result"] in ("win", "lose")]
+    pending = [r for r in actual if r["result"] not in ("win", "lose")]
+    lines = ["🎮 <b>Твои прогнозы «Обыграй ИИ»</b>"]
+    if settled:
+        lines.append("\n<b>Сыграно:</b>")
+        for r in settled[:12]:
+            home, away = _mk_teams(r)
+            sc = (r["score"] or "").strip()
+            score_part = f" {e(sc)} " if sc else " — "
+            u_ok = r["result"] == "win"
+            u_mark = "✅" if u_ok else "❌"
+            u_pick = PICK_LABEL.get(r["pick"], r["pick"])
+            ai_pick_code = r["ai_pick"]
+            if ai_pick_code in ("1", "X", "2"):
+                outcome = _outcome_from_score(sc) if sc else None
+                ai_ok = (outcome is not None and ai_pick_code == outcome)
+                ai_part = f"ИИ {PICK_LABEL.get(ai_pick_code, ai_pick_code)} {'✅' if ai_ok else '❌'}"
+                if r["beat_ai"]:
+                    note = " 🔥 обыграл ИИ"
+                elif ai_ok and not u_ok:
+                    note = " · ИИ оказался прав"
+                else:
+                    note = ""
+            else:
+                ai_part = "ИИ: прогноза не было"
+                note = ""
+            lines.append(f"{u_mark} <b>{e(home)}{score_part}{e(away)}</b>\n    ты: {u_pick} {u_mark} · {ai_part}{note}")
+    if pending:
+        lines.append("\n<b>Ждут результата:</b>")
+        for r in pending[:12]:
+            home, away = _mk_teams(r)
+            lines.append(f"⏳ {e(home)} — {e(away)} · твой выбор: <b>{PICK_LABEL.get(r['pick'], r['pick'])}</b>")
+    me = await db_user_week(user_id)
+    if me and ((me.get("total") or 0) or (me.get("pending") or 0)):
+        lines.append(f"\n📊 Эта неделя: <b>{me.get('pts') or 0}</b> очк. · место {me.get('rank')} · "
+                     f"угадал {me.get('wins') or 0}/{me.get('total') or 0} · обыграл ИИ {me.get('beat') or 0}×")
+    return ("\n".join(lines), kb)
+
 
 @dp.message(Command("mypicks"))
 async def cmd_mypicks(msg: Message):
-    """Диагностика: показывает сохранённые прогнозы пользователя из базы."""
     await db_touch_user(msg.from_user)
-    if not _pool:
-        return await msg.answer("База недоступна — прогнозы не сохраняются. Сообщи администратору.")
-    rows = await db_my_picks(msg.from_user.id)
-    actual = [r for r in rows if r["pick"] in ("1", "X", "2")]
-    if not actual:
-        return await msg.answer(
-            "У тебя пока нет сохранённых прогнозов в «Обыграй ИИ».\n"
-            "Открой «🎮 Сделать прогноз», выбери матч и нажми исход (П1 / Ничья / П2) — "
-            "после этого появишься в таблице недели.")
-    lines = [f"🎮 <b>Твои прогнозы</b> (всего {len(actual)}):"]
-    for r in actual[:15]:
-        parts = str(r["match_key"]).split("|")
-        teams = f"{parts[1]} — {parts[2]}" if len(parts) == 3 else r["match_key"]
-        pick = PICK_LABEL.get(r["pick"], r["pick"])
-        status = r["result"] or "ждёт результата"
-        pts = "" if r["points"] is None else f" · {r['points']} очк."
-        lines.append(f"• {e(teams)}: <b>{pick}</b> — {status}{pts}")
-    await msg.answer("\n".join(lines), disable_web_page_preview=True)
+    txt, kb = await _render_mypicks(msg.from_user.id)
+    await msg.answer(txt, reply_markup=kb, disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "iqmine")
+async def cb_iqmine(c: CallbackQuery):
+    await c.answer()
+    await db_touch_user(c.from_user)
+    txt, kb = await _render_mypicks(c.from_user.id)
+    await _send(c.message, True, txt, kb)
 
 @dp.callback_query(F.data.startswith("iq:"))
 async def cb_iq(c: CallbackQuery):
@@ -2059,7 +2116,7 @@ async def cb_iqplay(c: CallbackQuery):
 async def cb_iqtop(c: CallbackQuery):
     await c.answer()
     _, res = await get_data()
-    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="⬅️ В меню", callback_data="menu")
+    b = InlineKeyboardBuilder(); b.button(text="🎮 Сделать прогноз", callback_data="iqplay"); b.button(text="📋 Мои прогнозы", callback_data="iqmine"); b.button(text="⬅️ В меню", callback_data="menu")
     await _send(c.message, True, await _leaderboard_text(c.from_user.id, res), b.as_markup())
 
 
