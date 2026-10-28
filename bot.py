@@ -12,7 +12,7 @@
 Токен НЕ хранится в коде. Передаётся через переменную окружения BOT_TOKEN.
 Запуск локально:   BOT_TOKEN=xxxx python bot.py
 """
-import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime, itertools, math
+import os, time, re, asyncio, html, random, json, hmac, hashlib, datetime, itertools, math, unicodedata
 import aiohttp
 from aiohttp import web
 from urllib.parse import parse_qsl
@@ -188,6 +188,7 @@ def e(s):  # экранирование HTML
     return html.escape(str(s if s is not None else ""))
 
 AI_MIN_PROBABILITY = 70
+EXPRESS_MIN_PROBABILITY = 60  # порог включения мнения ИИ в экспресс (двойной шанс часто 60–69%)
 
 def ai_probability(opinion):
     if not isinstance(opinion, dict):
@@ -783,61 +784,33 @@ def express(data, n=3, res=None, today=None):
     for tournament, _, match in all_matches(data):
         if not _upcoming_today(match, today, res):
             continue
-        options = {}
-
-        def add_option(pick, price, estimated=False, support=0, ai_confidence=0):
-            key = _pick_key(pick, match)
-            if not key or not price or estimated:
-                return
-            item = options.get(key)
-            if item is None:
-                item = {
-                    "m": match, "pick": str(pick), "odd": price, "estimated": False,
-                    "mk": mkt(pick), "tour": tournament.get("short") or tournament.get("name", ""),
-                    "support": 0, "ai_confidence": 0, "probability": 1 / price,
-                }
-                options[key] = item
-            item["support"] += support
-            item["ai_confidence"] = max(item["ai_confidence"], ai_confidence)
-            if price > item["odd"]:
-                item["odd"] = price
-                if ai_confidence:
-                    item["pick"] = str(pick)
-            item["probability"] = 1 / item["odd"]
-
-        for tip in (match.get("tips") or []):
-            pick = str(tip.get("pick") or "").strip()
-            price = _valid_decimal(tip.get("k"))
-            if pick and price:
-                add_option(pick, price, support=1)
-
-        # Общие котировки 1X2 используются только внутри подбора;
-        # в карточке матча список букмекеров и их таблица не показываются.
-        raw_odds = match.get("odds") or []
-        for index, pick in enumerate(("П1", "Х", "П2")):
-            price = _valid_decimal(raw_odds[index] if index < len(raw_odds) else None)
-            if price:
-                add_option(pick, price)
-
+        # Экспресс показывает РОВНО то мнение ИИ, что и карточка матча:
+        # сначала Claude (ai), затем локальная модель (gpt). Коэффициент берём как есть
+        # (двойной шанс идёт с расчётным кф, помечается «≈»). Подмены рынка нет —
+        # так ставка в экспрессе совпадает с предматчевым мнением.
+        chosen = None
         for opinion in (match.get("ai") or {}, match.get("gpt") or {}):
-            if not ai_bet_eligible(opinion):
+            if not isinstance(opinion, dict) or opinion.get("eligible") is False:
                 continue
             pick = str(opinion.get("bet") or opinion.get("pick") or "").strip()
-            price, estimated = _price_for_pick(match, pick)
+            if not pick or not _pick_key(pick, match):
+                continue
             try:
                 confidence = int(ai_probability(opinion) or 0)
             except (TypeError, ValueError):
                 confidence = 0
-            if pick and price and confidence >= AI_MIN_PROBABILITY:
-                add_option(pick, price, estimated=estimated, ai_confidence=confidence)
-
-        if options:
-            # На матч оставляем один рынок: приоритет подтверждённому прогнозу ИИ,
-            # затем консенсусу источников и более вероятному исходу.
-            chosen = sorted(
-                options.values(),
-                key=lambda item: (-item["ai_confidence"], -item["support"], -item["probability"]),
-            )[0]
+            if confidence < EXPRESS_MIN_PROBABILITY:
+                continue
+            price, estimated = _price_for_pick(match, pick)
+            if not price:
+                continue
+            chosen = {
+                "m": match, "pick": pick, "odd": price, "estimated": bool(estimated),
+                "mk": mkt(pick), "tour": tournament.get("short") or tournament.get("name", ""),
+                "support": 0, "ai_confidence": confidence, "probability": 1 / price,
+            }
+            break  # приоритет Claude (ai); нашли мнение — локальную модель не берём
+        if chosen:
             candidates.append(chosen)
 
     candidates.sort(key=lambda item: (
@@ -860,12 +833,10 @@ def express(data, n=3, res=None, today=None):
                 total *= item["odd"]
             if total < 2.0:
                 continue
-            estimated_count = sum(bool(item.get("estimated")) for item in combo)
             confidence = sum(item["ai_confidence"] for item in combo)
             key = (
-                estimated_count,
-                total,
-                -confidence,
+                round(total, 3),      # минимальный итоговый коэффициент не ниже 2.0
+                -confidence,          # при равенстве — выше суммарная уверенность ИИ
                 tuple(item["m"].get("time") or "99:99" for item in combo),
             )
             if best_key is None or key < best_key:
@@ -1913,10 +1884,12 @@ async def settle_user_picks():
     norm_map = {}
     for k in await db_pending_match_keys():
         norm_map.setdefault(_norm_match_key(k), k)
+    finals = await _espn_finals()  # живой счёт с ESPN — считаем «Обыграй ИИ» не дожидаясь базы
     for t, i, m in all_matches(data):
-        # Счёт берём и из m.ft, и из results.json (res) — источник может прислать
-        # итог только в results.json, тогда m.ft пустой и расчёт раньше не срабатывал.
-        oc = _outcome_from_score(score_for_match(m, res))
+        # Счёт берём из m.ft, из results.json (res) и из живого ESPN — что раньше появится.
+        oc = _outcome_from_score(score_for_match(m, res)) or _outcome_from_score(
+            finals.get((m.get("date", ""), _rnorm(m.get("home", "")), _rnorm(m.get("away", ""))))
+        )
         if not oc:
             continue
         ai_out = _ai_outcome(m)
@@ -2193,6 +2166,143 @@ async def _notify_prematch(bot):
         print(f"notify pre: {date} {tm}, матчей {len(matches)}, частей {n}")
 
 
+# ===== Живые результаты из ESPN (бесплатно, без ключа) =====
+_ESPN_TEAM = {
+ "Arsenal":"Арсенал","Aston Villa":"Астон Вилла","Bayern München":"Бавария","Real Betis":"Бетис",
+ "Club Brugge":"Брюгге","Viking":"Викинг","Galatasaray":"Галатасарай","Inter":"Интер","Como":"Комо",
+ "LASK":"ЛАСК","Lens":"Ланс","RB Leipzig":"Лейпциг","Lille":"Лилль","Manchester United":"Манчестер Юнайтед",
+ "Real Madrid":"Реал Мадрид","Sporting CP":"Спортинг","Feyenoord":"Фейеноорд","Shakhtar Donetsk":"Шахтёр",
+ "AEK Athens":"АЕК","Atlético Madrid":"Атлетико Мадрид","Barcelona":"Барселона","Bodø/Glimt":"Буде-Глимт",
+ "FC Porto":"Порту","Liverpool":"Ливерпуль","Manchester City":"Манчестер Сити","Napoli":"Наполи",
+ "PSV Eindhoven":"ПСВ","Paris Saint-Germain":"ПСЖ","Roma":"Рома","Slovan Bratislava":"Слован",
+ "VfB Stuttgart":"Штутгарт","Villarreal":"Вильярреал",
+ # UEL
+ "AZ Alkmaar":"Алкмаар","Anderlecht":"Андерлехт","Ararat Armenia":"Арарат-Армения","Bayer Leverkusen":"Байер",
+ "Benfica":"Бенфика","Beşiktaş":"Бешикташ","AFC Bournemouth":"Борнмут","Dinamo Zagreb":"Динамо Загреб",
+ "Crystal Palace":"Кристал Пэлас","Lyon":"Лион","Marseille":"Марсель","Milan":"Милан",
+ "NEC Nijmegen":"Неймеген","Olympiacos":"Олимпиакос","Real Sociedad":"Реал Сосьедад","Rennes":"Ренн",
+ "Sunderland":"Сандерленд","Celtic":"Селтик","Celta Vigo":"Сельта","Torreense":"Торреенсе",
+ "Ferencváros":"Ференцварош","Hoffenheim":"Хоффенхайм","Sturm Graz":"Штурм","Juventus":"Ювентус",
+ "Hapoel Beer Sheva":"Хапоэль Беэр-Шева","Jagiellonia Białystok":"Ягеллония","Lech Poznań":"Лех",
+ "Levski Sofia":"Левски","Lillestrøm":"Лиллестрём","NK Celje":"Целе","OFI Crete":"ОФИ",
+ "Omonia Nicosia":"Омония","Salzburg":"Зальцбург","Sparta Prague":"Спарта Прага",
+ "Union St.Gilloise":"Юнион Сен-Жиллуаз","Viktoria Plzeň":"Виктория Пльзень",
+ # EPL
+ "Brighton & Hove Albion":"Брайтон","Brentford":"Брентфорд","Ipswich Town":"Ипсвич","Coventry City":"Ковентри",
+ "Leeds United":"Лидс","Nottingham Forest":"Ноттингем Форест","Newcastle United":"Ньюкасл","Tottenham Hotspur":"Тоттенхэм",
+ "Fulham":"Фулхэм","Hull City":"Халл","Chelsea":"Челси","Everton":"Эвертон",
+ # LaLiga
+ "Deportivo Alavés":"Алавес","Athletic Club":"Атлетик","Valencia":"Валенсия","Deportivo A Coruña":"Депортиво",
+ "Levante":"Леванте","Málaga":"Малага","Osasuna":"Осасуна","Rayo Vallecano":"Райо Вальекано","Racing Santander":"Расинг",
+ "Sevilla":"Севилья","Getafe":"Хетафе","Elche":"Эльче","Espanyol":"Эспаньол",
+ # SerieA
+ "Atalanta":"Аталанта","Bologna":"Болонья","Venezia":"Венеция","Genoa":"Дженоа","Cagliari":"Кальяри",
+ "Lazio":"Лацио","Lecce":"Лечче","Monza":"Монца","Parma":"Парма","Sassuolo":"Сассуоло","Torino":"Торино",
+ "Udinese":"Удинезе","Fiorentina":"Фиорентина","Frosinone":"Фрозиноне",
+ # Bundesliga
+ "Eintracht Frankfurt":"Айнтрахт Франкфурт","Augsburg":"Аугсбург","Borussia Dortmund":"Боруссия Дортмунд",
+ "Borussia Mönchengladbach":"Боруссия Мёнхенгладбах","Werder Bremen":"Вердер","Hamburger SV":"Гамбург",
+ "1. FC Köln":"Кёльн","Mainz 05":"Майнц","Paderborn":"Падерборн","Union Berlin":"Унион Берлин","Freiburg":"Фрайбург",
+ "Schalke 04":"Шальке","Elversberg":"Эльферсберг",
+ # Ligue1
+ "Angers":"Анже","Brest":"Брест","Le Havre":"Гавр","Le Mans":"Ле-Ман","Lorient":"Лорьян","Monaco":"Монако",
+ "Nice":"Ницца","Auxerre":"Осер","Paris FC":"Париж","Strasbourg":"Страсбур","Troyes":"Труа","Toulouse":"Тулуза",
+ # RPL
+ "Akron Togliatti":"Акрон","FK Akhmat":"Ахмат","Baltika":"Балтика","Dinamo Moscow":"Динамо",
+ "Dynamo Makhachkala":"Динамо (Махачкала)","Zenit St. Petersburg":"Зенит","FC Krasnodar":"Краснодар",
+ "Krylya Sovetov Samara":"Крылья Советов","Lokomotiv Moscow":"Локомотив","FC Orenburg":"Оренбург",
+ "Rodina":"Родина","FC Rostov":"Ростов","Rubin Kazan":"Рубин","Spartak Moscow":"Спартак","Fakel":"Факел","CSKA Moscow":"ЦСКА",
+}
+
+ESPN_LEAGUES = ("eng.1","esp.1","ita.1","ger.1","fra.1","rus.1","uefa.champions","uefa.europa")
+
+def _espn_normname(value):
+    value = str(value or "").casefold().translate(str.maketrans({"ł":"l","ø":"o","æ":"ae","œ":"oe","ß":"ss"}))
+    value = unicodedata.normalize("NFKD", value).encode("ascii","ignore").decode("ascii")
+    value = re.sub(r"\b(?:fc|afc|cf|sc|ac|as|club|rb|nk|fk)\b", "", value)
+    return re.sub(r"[^a-z0-9]", "", value)
+
+_ESPN_BY_NAME = {_espn_normname(s): t for s, t in _ESPN_TEAM.items()}
+_ESPN_BY_NAME.update({"manutd": "Манчестер Юнайтед", "manunited": "Манчестер Юнайтед",
+    "mancity": "Манчестер Сити", "athleticbilbao": "Атлетик",
+    "intermilan": "Интер", "internazionale": "Интер",
+    "bayernmunich": "Бавария", "parissaintgermain": "ПСЖ",
+    "lasklinz": "ЛАСК", "hapoelbeer": "Хапоэль Беэр-Шева",
+    "akhmatgrozny": "Ахмат", "akrontolyatti": "Акрон", "alaves": "Алавес",
+    "deportivo": "Депортиво", "cologne": "Кёльн", "fakelvoronezh": "Факел",
+    "hamburgsv": "Гамбург", "krylyasovetov": "Крылья Советов",
+    "kryliasovetov": "Крылья Советов", "mainz": "Майнц",
+    "fenerbahce": "Фенербахче", "sabah": "Сабах",
+    "slaviaprague": "Славия", "slaviapraha": "Славия",
+    "psg": "ПСЖ", "barcelona": "Барселона", "realmadrid": "Реал Мадрид",})
+
+def _espn_team_ru(team):
+    cands = (team.get("displayName"), team.get("name"), team.get("shortDisplayName")) if isinstance(team, dict) else (team,)
+    for c in cands:
+        if c:
+            mm = _ESPN_BY_NAME.get(_espn_normname(c))
+            if mm:
+                return mm
+    return None
+
+def _rnorm(s):
+    return str(s or "").replace("РБ ","").replace("ФК ","").lower().replace(" ","").replace("-","").replace("ё","е")
+
+_espn_cache = {"t": 0.0, "finals": {}}
+
+async def _espn_finals():
+    """{(date,_rnorm(home),_rnorm(away)): 'H:A'} для завершённых матчей (сегодня-вчера). Кэш 120 c; при сбое — прежний кэш."""
+    now = time.time()
+    if _espn_cache["finals"] and now - _espn_cache["t"] < 120:
+        return _espn_cache["finals"]
+    msk = datetime.timezone(datetime.timedelta(hours=3))
+    today = datetime.datetime.now(msk).date()
+    dks = {(today - datetime.timedelta(days=d)).strftime("%Y%m%d") for d in (0, 1)}
+    finals = {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            for league in ESPN_LEAGUES:
+                for dk in dks:
+                    payload = await fetch_json(s, f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard?dates={dk}")
+                    for ev in (payload or {}).get("events", []):
+                        try:
+                            ko = datetime.datetime.fromisoformat(str(ev.get("date","")).replace("Z","+00:00"))
+                            if ko.tzinfo is None:
+                                ko = ko.replace(tzinfo=datetime.timezone.utc)
+                            ld = ko.astimezone(msk).strftime("%Y-%m-%d")
+                        except (TypeError, ValueError):
+                            continue
+                        comps = ev.get("competitions") or []
+                        if not comps:
+                            continue
+                        comp = comps[0]
+                        st = ((comp.get("status") or ev.get("status") or {}).get("type") or {})
+                        if not (st.get("completed") or st.get("state") == "post"):
+                            continue
+                        home = away = hs = asc = None
+                        for c in comp.get("competitors", []):
+                            ru = _espn_team_ru(c.get("team", {}))
+                            sc = str(c.get("score", ""))
+                            if c.get("homeAway") == "home":
+                                home, hs = ru, sc
+                            elif c.get("homeAway") == "away":
+                                away, asc = ru, sc
+                        if home and away and hs and asc and hs.isdigit() and asc.isdigit():
+                            finals[(ld, _rnorm(home), _rnorm(away))] = f"{hs}:{asc}"
+        _espn_cache.update(t=now, finals=finals)
+    except Exception as ex:
+        print("espn_finals:", ex)
+        return _espn_cache["finals"]
+    return finals
+
+def _match_ft(m, finals):
+    ft = m.get("ft")
+    if ft and _outcome_from_score(ft):
+        return re.sub(r"\s*[-:]\s*", ":", str(ft)).strip()
+    live = finals.get((m.get("date",""), _rnorm(m.get("home","")), _rnorm(m.get("away",""))))
+    return live if (live and _outcome_from_score(live)) else None
+
+
 async def _notify_results(bot):
     """После матча (появился ft) — «ИИ угадал / не зашло». Завершившиеся на одно
     время старта группируются в одно сообщение. Окно по возрасту старта защищает
@@ -2200,27 +2310,29 @@ async def _notify_results(bot):
     data, _ = await get_data()
     if not data:
         return
+    finals = await _espn_finals()  # живой счёт с ESPN (бесплатно, без ожидания базы)
     now = datetime.datetime.now(MSK_TZ)
-    groups = {}  # (date, time) -> [matches], только свежезавершившиеся и ещё не разосланные
+    groups = {}  # (date, time) -> [(m, ft)], только свежезавершившиеся и ещё не разосланные
     for t, i, m in all_matches(data):
-        ft = m.get("ft")
-        if not ft or not _outcome_from_score(ft):
+        ft = _match_ft(m, finals)
+        if not ft:
             continue
         k = _kickoff(m)
         if not k:
             continue
-        age_min = (now - k).total_seconds() / 60.0
-        if not (NOTIFY_RESULT_MIN_AGE <= age_min <= NOTIFY_RESULT_MAX_AGE):
+        age_h = (now - k).total_seconds() / 3600.0
+        # Постим только недавно завершившиеся (защита от рассылки старых при рестарте).
+        if not (0.5 <= age_h <= 6.0):
             continue
         if not await _notify_claim(f"res|{_mkey(m)}"):
             continue
-        groups.setdefault((m.get("date", ""), m.get("time", "")), []).append(m)
+        groups.setdefault((m.get("date", ""), m.get("time", "")), []).append((m, ft))
     for _, matches in groups.items():
         out = []
         if len(matches) > 1:
             out.append("📣 <b>Итоги матчей</b>\n")
-        for m in matches:
-            ft = re.sub(r"\s*[-:]\s*", ":", str(m.get("ft"))).strip()
+        for m, ft in matches:
+            ft = re.sub(r"\s*[-:]\s*", ":", str(ft)).strip()
             oc = _outcome_from_score(ft)
             ai = _ai_outcome(m)
             if ai and oc:
