@@ -232,9 +232,38 @@ async def fetch_json(session, url):
 def gpt_key(date, home, away):
     return f"{date}|{home}|{away}"
 
+def _local_pick_sane(pick, odds):
+    """Фильтр здравого смысла для локальной модели.
+    Возвращает False, если пик ставит на явного аутсайдера против тяжёлого фаворита
+    (локалка иногда выдаёт такое с высокой «уверенностью» — это ляп, не прогноз).
+    odds = [кф П1, кф Х, кф П2]."""
+    try:
+        o1, ox, o2 = (float(odds[0]), float(odds[1]), float(odds[2]))
+    except Exception:
+        return True  # нет котировок — не можем судить, пропускаем как есть
+    if not (o1 > 1 and ox > 1 and o2 > 1):
+        return True
+    fav = min(o1, ox, o2)
+    HEAVY, LONG = 1.6, 3.0
+    raw = str(pick or "").strip().upper().replace("X", "Х")
+    p = ""
+    for code in ("1Х", "Х2", "12", "П1", "П2", "Х"):
+        if raw.startswith(code):
+            p = code; break
+    # прямой исход на аутсайдера против тяжёлого фаворита
+    if p == "П1" and o1 >= LONG and o2 <= HEAVY: return False
+    if p == "П2" and o2 >= LONG and o1 <= HEAVY: return False
+    if p == "Х"  and ox >= 4.5 and fav <= 1.40:  return False
+    # двойной шанс, исключающий почти тотального фаворита
+    if p == "1Х" and o2 == fav and o2 <= 1.35:   return False
+    if p == "Х2" and o1 == fav and o1 <= 1.35:   return False
+    return True
+
 def merge_gpt(data, gpt):
     """Вливает мнения ChatGPT из отдельного gpt.json в матчи data.json.
-    Ключ матча: 'дата|хозяева|гости'. Если в data.json мнение уже есть — не трогаем."""
+    Ключ матча: 'дата|хозяева|гости'. Если в data.json мнение уже есть — не трогаем.
+    Абсурдные пики локальной модели (аутсайдер против тяжёлого фаворита) не прикрепляем:
+    они не показываются в приложении, не идут в экспресс и в пост."""
     if not data or not gpt:
         return
     gm = gpt.get("matches") if isinstance(gpt, dict) else None
@@ -246,6 +275,9 @@ def merge_gpt(data, gpt):
                 continue
             op = gm.get(gpt_key(m.get("date",""), m.get("home",""), m.get("away","")))
             if isinstance(op, dict):
+                pick = op.get("bet") or op.get("pick")
+                if not _local_pick_sane(pick, m.get("odds") or []):
+                    continue  # отбрасываем ляп локалки
                 m["gpt"] = op
 
 async def get_data(force=False):
