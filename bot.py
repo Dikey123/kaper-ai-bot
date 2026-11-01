@@ -2225,6 +2225,16 @@ NOTIFY_PRE_MIN = 55            # нижняя граница окна «за ч�
 NOTIFY_PRE_MAX = 65            # верхняя граница окна «за час до матча», мин
 NOTIFY_RESULT_MIN_AGE = 90     # матч попадает в «итоги», если стартовал не раньше, мин
 NOTIFY_RESULT_MAX_AGE = 300    # ...и не позже, мин (защита от рассылки старых результатов при старте)
+RESULT_ABANDON_H = 4.0         # через столько часов после старта перестаём ждать счёт (для дайджеста итогов)
+QUIET_START = 0                # тихие часы по МСК: предматч-пинги не публикуем в [QUIET_START, QUIET_END)
+QUIET_END = 9
+
+
+def _in_quiet_hours(now=None):
+    """Тихие часы (ночь по МСК): рутинные предматч-пинги не публикуем, чтобы не копить
+    бейджи среди ночи. Дневной пост в 13:30 и вечерний дайджест итогов это не затрагивает."""
+    now = now or datetime.datetime.now(MSK_TZ)
+    return QUIET_START <= now.hour < QUIET_END
 
 
 async def _notify_claim(key):
@@ -2243,16 +2253,20 @@ async def _notify_claim(key):
         return False
 
 
-async def _notify_channel(bot, text):
+async def _notify_channel(bot, text, silent=True):
     """Публикация уведомления в канал (REQUIRED_CHAT), а не в личные сообщения.
-    Длинный текст режется на части; каждая отправка защищена try/except."""
+    Длинный текст режется на части; каждая отправка защищена try/except.
+    silent=True (по умолчанию) — доставка без звука (disable_notification): рутинные
+    уведомления не будят группу, поэтому мьютить её больше незачем. Звук оставлен
+    только дневному посту 13:30 (post_daily шлёт напрямую, не через эту функцию)."""
     if not REQUIRED_CHAT:
         return 0
     chunks = _split_telegram_text(text)
     sent = 0
     for chunk in chunks:
         try:
-            await bot.send_message(REQUIRED_CHAT, chunk, disable_web_page_preview=True)
+            await bot.send_message(REQUIRED_CHAT, chunk, disable_web_page_preview=True,
+                                   disable_notification=silent)
             sent += 1
         except Exception as ex:
             print("notify channel send:", ex)
@@ -2274,9 +2288,17 @@ def _notify_lineups(m):
 # «Лучший прогноз дня». Оставлены напоминания за час до матча и итоги матчей.
 
 
+def _prematch_worthy(m):
+    """Ценный матч для предматч-пинга: уверенный пик ИИ (eligible + вероятность ≥ порога).
+    Остальные матчи и так есть в дневном посте 13:30 и в приложении — пинг по ним лишний."""
+    return ai_bet_eligible(m.get("ai")) or ai_bet_eligible(m.get("gpt"))
+
+
 async def _notify_prematch(bot):
-    """За ~час до старта: матчи с началом через NOTIFY_PRE_MIN..NOTIFY_PRE_MAX минут.
-    Матчи на одно время — одним сообщением."""
+    """За ~час до старта — ТОЛЬКО по ценным матчам (уверенный пик ИИ), чтобы пинг был
+    осмысленным, а не на каждый матч. Матчи на одно время — одним сообщением. Тихо."""
+    if _in_quiet_hours():
+        return
     data, _ = await get_data()
     if not data:
         return
@@ -2284,6 +2306,8 @@ async def _notify_prematch(bot):
     groups = {}  # (date, time) -> [matches]
     for t, i, m in all_matches(data):
         if m.get("ft"):
+            continue
+        if not _prematch_worthy(m):
             continue
         k = _kickoff(m)
         if not k:
@@ -2455,45 +2479,56 @@ def _match_ft(m, finals):
 
 
 async def _notify_results(bot):
-    """После матча (появился ft) — «ИИ угадал / не зашло». Завершившиеся на одно
-    время старта группируются в одно сообщение. Окно по возрасту старта защищает
-    от рассылки старых результатов при первом запуске."""
+    """Один раз в день — сводка «Итоги дня» по всем сегодняшним матчам, когда все
+    стартовавшие матчи дня завершились (появился счёт) или заброшены (старт > RESULT_ABANDON_H
+    назад без счёта). Вместо ~20 сообщений по слотам весь вечер — одно тихое сообщение.
+    Дедуп по дню (resday|дата). Личные итоги игрокам идут отдельно (_notify_player_results)."""
     data, _ = await get_data()
     if not data:
         return
     finals = await _espn_finals()  # живой счёт с ESPN (бесплатно, без ожидания базы)
     now = datetime.datetime.now(MSK_TZ)
-    groups = {}  # (date, time) -> [(m, ft)], только свежезавершившиеся и ещё не разосланные
+    today = now.date().isoformat()
+    pending = 0              # матчи дня, которые ещё ждём (не начались или идут без счёта)
+    results = []             # [(m, ft)] завершившиеся сегодня
     for t, i, m in all_matches(data):
-        ft = _match_ft(m, finals)
-        if not ft:
+        if m.get("date") != today:
             continue
         k = _kickoff(m)
         if not k:
             continue
-        age_h = (now - k).total_seconds() / 3600.0
-        # Постим только недавно завершившиеся (защита от рассылки старых при рестарте).
-        if not (0.5 <= age_h <= 6.0):
+        if k > now:
+            pending += 1         # ещё не начался — день не окончен, ждём
             continue
-        if not await _notify_claim(f"res|{_mkey(m)}"):
-            continue
-        groups.setdefault((m.get("date", ""), m.get("time", "")), []).append((m, ft))
-    for _, matches in groups.items():
-        out = []
-        if len(matches) > 1:
-            out.append("📣 <b>Итоги матчей</b>\n")
-        for m, ft in matches:
-            ft = re.sub(r"\s*[-:]\s*", ":", str(ft)).strip()
-            ai_code, ai_won = _ai_bet(m, ft)
-            if ai_code and ai_won is not None:
-                head = "✅ ИИ угадал" if ai_won else "❌ Не зашло"
-                tail = f" (прогноз ИИ {e(ai_code)})"
-            else:
-                head, tail = "🏁 Итог", ""
-            out.append(f"{head}: <b>{e(m.get('home'))} {e(ft)} {e(m.get('away'))}</b>{tail}")
-        out.append("\n18+")
-        n = await _notify_channel(bot, "\n".join(out))
-        print(f"notify result: матчей {len(matches)}, частей {n}")
+        ft = _match_ft(m, finals)
+        if ft:
+            results.append((m, ft))
+        elif (now - k).total_seconds() / 3600.0 <= RESULT_ABANDON_H:
+            pending += 1         # идёт/недавно начался, счёта пока нет — ждём
+        # старт > RESULT_ABANDON_H назад и без счёта — считаем заброшенным, не блокируем дайджест
+    if pending or not results:
+        return                   # не все матчи дня сыграны, либо нечего публиковать
+    if not await _notify_claim(f"resday|{today}"):
+        return                   # дайджест за сегодня уже публиковали
+    results.sort(key=lambda mf: (mf[0].get("time") or ""))
+    out = ["📣 <b>Итоги дня</b>\n"]
+    win = lose = 0
+    for m, ft in results:
+        ft = re.sub(r"\s*[-:]\s*", ":", str(ft)).strip()
+        ai_code, ai_won = _ai_bet(m, ft)
+        if ai_code and ai_won is not None:
+            icon = "✅" if ai_won else "❌"
+            tail = f" (ИИ {e(ai_code)})"
+            win += 1 if ai_won else 0
+            lose += 0 if ai_won else 1
+        else:
+            icon, tail = "🏁", ""
+        out.append(f"{icon} <b>{e(m.get('home'))} {e(ft)} {e(m.get('away'))}</b>{tail}")
+    if win + lose:
+        out.append(f"\n<b>Прогнозы ИИ: угадано {win} из {win + lose}</b>")
+    out.append("\n18+")
+    n = await _notify_channel(bot, "\n".join(out))  # тихо (silent=True по умолчанию)
+    print(f"notify result digest: {today}, матчей {len(results)}, частей {n}")
 
 
 async def db_recent_settled():
