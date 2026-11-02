@@ -477,9 +477,10 @@ def screen_match(t, m, res=None):
             cnt[tp["lean"]] += 1
     if sum(cnt.values()):
         lines.append(f"\n<b>Куда склоняются эксперты</b> ({sum(cnt.values())} прогнозов): " + bar(cnt))
-    # Мнения ИИ — два источника (Claude в поле "ai", ChatGPT в поле "gpt")
-    for blk in (opinion_block(m.get("ai"), "🤖", "ИИ", m),
-                opinion_block(m.get("gpt"), "🧠", "ChatGPT", m)):
+    # Мнения ИИ. Основной прогноз — локальная модель (поле "gpt"); облачный Claude
+    # (поле "ai") идёт резервом и показывается, когда у локалки прогноза нет.
+    for blk in (opinion_block(m.get("gpt"), "🤖", "ИИ", m),
+                opinion_block(m.get("ai"), "🧠", "ИИ · Claude", m)):
         if blk:
             lines.append(blk)
     return "\n".join(lines)
@@ -820,11 +821,11 @@ def express(data, n=3, res=None, today=None):
         if not _upcoming_today(match, today, res):
             continue
         # Экспресс показывает РОВНО то мнение ИИ, что и карточка матча:
-        # сначала Claude (ai), затем локальная модель (gpt). Коэффициент берём как есть
-        # (двойной шанс идёт с расчётным кф, помечается «≈»). Подмены рынка нет —
-        # так ставка в экспрессе совпадает с предматчевым мнением.
+        # сначала локальная модель (gpt, основная), затем облачный Claude (ai, резерв).
+        # Коэффициент берём как есть (двойной шанс идёт с расчётным кф, помечается «≈»).
+        # Подмены рынка нет — так ставка в экспрессе совпадает с предматчевым мнением.
         chosen = None
-        for opinion in (match.get("ai") or {}, match.get("gpt") or {}):
+        for opinion in (match.get("gpt") or {}, match.get("ai") or {}):
             if not isinstance(opinion, dict) or opinion.get("eligible") is False:
                 continue
             pick = str(opinion.get("bet") or opinion.get("pick") or "").strip()
@@ -1206,7 +1207,7 @@ def _daily_model_candidates(data, res, today):
         if not _upcoming_today(match, today, res):
             continue
         opinions = []
-        for key, label in (("ai", "Claude"), ("gpt", "ChatGPT")):
+        for key, label in (("gpt", "ИИ"), ("ai", "Claude")):
             opinion = match.get(key)
             if not ai_bet_eligible(opinion):
                 continue
@@ -1723,7 +1724,7 @@ def _outcome_from_score(s):
     return "1" if h > a else ("2" if a > h else "X")
 
 def _ai_outcome(m):
-    for k in ("ai", "gpt"):
+    for k in ("gpt", "ai"):
         op = m.get(k) or {}
         o = _outcome_from_score(op.get("score"))
         if o:
@@ -1746,11 +1747,11 @@ def _settle_key_won(key, oc):
 
 def _ai_bet(m, score):
     """Реальная ставка ИИ (код, напр. «Х2»/«1Х»/«П1») и выиграла ли она — как в settle.py (с двойным шансом).
-    Приоритет ai (Claude), затем gpt. Возвращает (код_или_None, won_или_None); won=None — рынок по исходу не рассчитать."""
+    Приоритет локальной модели (gpt), затем Claude (ai, резерв). Возвращает (код_или_None, won_или_None); won=None — рынок по исходу не рассчитать."""
     oc = _outcome_from_score(score)
     if not oc:
         return None, None
-    for k in ("ai", "gpt"):
+    for k in ("gpt", "ai"):
         op = m.get(k) or {}
         if not isinstance(op, dict):
             continue
