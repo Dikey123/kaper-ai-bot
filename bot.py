@@ -1259,22 +1259,46 @@ def _daily_model_candidates(data, res, today):
 
 
 def _daily_predictions_block(data, res, today, express_legs=None):
+    """Пост в канал = витрина. VIP «Прогноз дня» и готовый экспресс гейтятся в бота
+    (причина открыть бота), обычные прогнозы ИИ остаются в канале. Полные VIP-выбор
+    и состав экспресса доступны в боте — он требует подписки на канал."""
     candidates = _daily_model_candidates(data, res, today)
     out = []
+    # Гейт VIP имеет смысл, только когда в канале остаётся что показать помимо него.
+    gate = len(candidates) >= 3
     if candidates:
-        best = candidates[0]
-        meta = []
-        if best["score"]:
-            meta.append(f"счёт ИИ {e(best['score'])}")
-        if best["time"]:
-            meta.append(e(best["time"]))
-        suffix = " · " + " · ".join(meta) if meta else ""
-        price = ("≈" if best["coefficient_estimated"] else "") + f"{best['coefficient']:.2f}"
-        out.extend([
-            "🎯 <b>Лучший прогноз дня</b>",
-            f"<b>{e(best['home'])} — {e(best['away'])}</b> · {e(best['tournament'])}",
-            f"Выбор ИИ: <b>{e(best['bet'])}</b> — кф <b>{price}</b>{suffix}",
-        ])
+        vip = candidates[0]
+        if gate:
+            meta = f" · {e(vip['time'])}" if vip["time"] else ""
+            out.extend([
+                "🎯 <b>Прогноз дня от ИИ</b>",
+                f"<b>{e(vip['home'])} — {e(vip['away'])}</b> · {e(vip['short_tournament'])}{meta}",
+                "🔒 Выбор ИИ и коэффициент — в боте",
+            ])
+            regular = candidates[1:6]
+            if regular:
+                out.append("\n📋 <b>Ещё прогнозы ИИ на сегодня</b>")
+                for c in regular:
+                    price = ("≈" if c["coefficient_estimated"] else "") + f"{c['coefficient']:.2f}"
+                    tm = f", {e(c['time'])}" if c["time"] else ""
+                    out.append(
+                        f"• <b>{e(c['home'])} — {e(c['away'])}</b> "
+                        f"({e(c['short_tournament'])}{tm}): {e(c['bet'])} — кф <b>{price}</b>"
+                    )
+        else:
+            # Маломатчевый день — не оголяем канал, показываем лучший прогноз целиком.
+            meta = []
+            if vip["score"]:
+                meta.append(f"счёт ИИ {e(vip['score'])}")
+            if vip["time"]:
+                meta.append(e(vip["time"]))
+            suffix = " · " + " · ".join(meta) if meta else ""
+            price = ("≈" if vip["coefficient_estimated"] else "") + f"{vip['coefficient']:.2f}"
+            out.extend([
+                "🎯 <b>Лучший прогноз дня</b>",
+                f"<b>{e(vip['home'])} — {e(vip['away'])}</b> · {e(vip['tournament'])}",
+                f"Выбор ИИ: <b>{e(vip['bet'])}</b> — кф <b>{price}</b>{suffix}",
+            ])
     else:
         out.extend([
             "🎯 <b>Прогноз дня</b>",
@@ -1284,24 +1308,18 @@ def _daily_predictions_block(data, res, today, express_legs=None):
     legs = express_legs if express_legs is not None else express(data, 3, res=res, today=today)
     if len(legs) >= 3:
         total = 1.0
-        out.append(f"\n⚡ <b>Экспресс дня — {len(legs)} события</b>")
-        for index, item in enumerate(legs, 1):
+        for item in legs:
             total *= item["odd"]
-            price = _format_pick_price(item)
-            out.append(
-                f"{index}. <b>{e(item['m']['home'])} — {e(item['m']['away'])}</b> "
-                f"({e(item['tour'])}, {e(item['m'].get('time') or 'время уточняется')})\n"
-                f"   {e(item['pick'])} — кф <b>{price}</b>"
-            )
         marker = "≈" if any(item.get("estimated") for item in legs) else ""
-        out.append(f"<b>Общий коэффициент: {marker}{total:.2f}</b>")
-        if any(item.get("estimated") for item in legs):
-            out.append("<i>≈ — расчётный коэффициент двойного шанса по котировкам 1X2, "
-                       "а не прямая котировка букмекера.</i>")
+        out.append(f"\n⚡ <b>Экспресс дня — {len(legs)} события на общий кф {marker}{total:.2f}</b>")
+        out.append("🔒 Матчи и ставки экспресса — в боте")
+        if marker:
+            out.append("<i>≈ — расчётный коэффициент двойного шанса по котировкам 1X2.</i>")
     else:
         out.append("\n⚡ <b>Экспресс дня</b>")
         out.append("Нет подходящей комбинации из 3–5 событий с общим коэффициентом от 2.00; "
                    "непроверенные цены не публикуем.")
+    out.append("\n👉 <b>Прогноз дня и готовый экспресс целиком — бесплатно в боте</b> (нужна подписка на канал)")
     out.append("<i>Экспресс рискованнее одиночной ставки: должны пройти все выбранные события. 18+</i>")
     return "\n".join(out)
 
